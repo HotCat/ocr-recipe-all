@@ -1,0 +1,32 @@
+
+in
+/home/hotcat/Downloads/LearnOpenGL.hs/GettingStarted/allInOne
+
+this is my old handcraft openGL + opencv + dear imgui + scheme DSL + haskell yampa DSL, it works extremely well on old platform, stable and reliable. but it is too old, many depends, making it harder to migrant to new OS. for the era of AI, I want to rewrite it in python pyside6, but still preserve its openGL FRP style architecture. I want to get rid of scheme DSL and adopt python node editor to make all the configuration of production rules for different batch of product OCR requirement. so please explore this repository thoroughly, follow all the dependences
+
+for python node editor, I did a demo of it (https://github.com/HotCat/ocr-recipe-demo). I like the node concept to build workflow during runtime. but I don't like the UI experience, I want the nodes editing overlay or float on the camera preview frame(OpenGL framebuffer). the nodes can be completely hide with the control of the user in another floating UI controls
+
+please write me a new pyside6 architecture, so I could experiment node editor over a camera live frame, build a workflow which works asynchronous with the camera live frame, triggered by a keyboard shortcut, it could capture a ROI of camera live frame, doing all the workflow processing, aggregate the result
+
+
+I execute PYTHONPATH=src python3 -B -m openfrp_vision.app, but I did not see any nodes
+
+please consult /home/hotcat/Downloads/cadrefs repository to port hikvision industrial camera driver to this project and display the live frame on HUD. the camera paramters tweaks UI should allocated a dedicated nodes for it
+
+all the nodes show 'Not run'. is there any keyboard shortcut to trigger it? I want 'Camera Parameers' to connect to a node for realtime camera live frame review. while another switch node to setup the keyboard shortcut or other external trigger to trigger the workflow
+
+please implement camera live frame for me, I still not see the live camera frame
+
+the App found the camera, but there's still no live frame preview
+
+now you should add node connection edit function, so I could add or delete nodes. also implement each nodes function, like Serial ROI, enable the user interactively select the ROI and OCR nodes is running a paddleOCR. add a debug node which can write the result image output to file or pop up a image display window
+
+please commit the current project to https://github.com/HotCat
+
+I've created a remote repository for this project, please push the current repository
+
+git remote add origin https://github.com/HotCat/ocr-recipe-all.git
+git branch -M main
+git push -u origin main
+
+
