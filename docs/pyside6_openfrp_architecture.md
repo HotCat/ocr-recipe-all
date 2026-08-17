@@ -126,7 +126,29 @@ Every node should declare input port types, output port type, default parameters
 
 ## Recipe Document
 
-Use versioned JSON first. YAML is nice for humans, but JSON is easier for strict round trips from a node editor.
+Use versioned JSON first. YAML is nice for humans, but JSON is easier for strict round trips from a node editor. The application stores product profiles in one profile config file:
+
+```text
+~/.config/openfrp_vision/profiles.json
+```
+
+Set `OPENFRP_PROFILE_CONFIG=/path/to/profiles.json` to use a deployment-specific config file. Each product profile owns its graph nodes, edges, node positions, ROI coordinates, camera settings, trigger shortcut, OCR parameters, regex rules, and debug-output settings.
+
+```json
+{
+  "format": "openfrp-vision/profiles/v1",
+  "active_profile": "default",
+  "profiles": {
+    "default": {
+      "name": "Default Product",
+      "updated_at": "2026-08-17T07:00:00+00:00",
+      "graph": {}
+    }
+  }
+}
+```
+
+The graph payload inside each profile is the versioned recipe document:
 
 ```json
 {

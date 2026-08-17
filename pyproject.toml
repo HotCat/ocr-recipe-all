@@ -15,8 +15,8 @@ dependencies = [
 
 [project.optional-dependencies]
 ocr = [
-  "paddleocr>=2.7",
-  "paddlepaddle>=2.6",
+  "paddleocr>=2.7,<3",
+  "paddlepaddle>=2.6,<3",
 ]
 
 [project.scripts]

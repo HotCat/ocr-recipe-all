@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import copy
 from time import perf_counter
 from typing import Any, Callable
 
@@ -199,7 +200,7 @@ class RecipeGraph:
                     "type": node.type_name,
                     "title": node.title,
                     "position": [node.x, node.y],
-                    "params": node.params,
+                    "params": {key: copy.deepcopy(value) for key, value in node.params.items() if key != "snapshot"},
                 }
                 for node in self.nodes.values()
             ],
@@ -208,3 +209,23 @@ class RecipeGraph:
                 for edge in self.edges
             ],
         }
+
+    @classmethod
+    def from_dict(cls, definitions: dict[str, NodeDefinition], data: dict[str, Any]) -> "RecipeGraph":
+        if data.get("format") != cls.FORMAT:
+            raise GraphError(f"Unsupported recipe format: {data.get('format')}")
+
+        graph = cls(definitions, int(data.get("revision", 0)))
+        for item in data.get("nodes", []):
+            node_id = str(item["id"])
+            type_name = str(item["type"])
+            title = str(item.get("title") or definitions[type_name].title)
+            position = item.get("position", [0, 0])
+            params = dict(item.get("params", {}))
+            graph.add_node(RecipeNode(node_id, type_name, title, float(position[0]), float(position[1]), params))
+
+        for item in data.get("edges", []):
+            graph.connect(str(item["source"]), str(item["target"]), str(item["target_port"]))
+        graph.revision = int(data.get("revision", graph.revision))
+        graph.results.clear()
+        return graph

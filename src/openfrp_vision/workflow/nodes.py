@@ -11,6 +11,7 @@ from openfrp_vision.workflow.model import NodeDefinition, NodeResult, PortSpec, 
 
 
 _PADDLE_OCR = None
+_PADDLE_OCR_USE_CLS_ARG = True
 
 
 def _as_image(value: Any) -> Any:
@@ -150,26 +151,43 @@ def _aggregate(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
 
 
 def _paddle_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
-    global _PADDLE_OCR
+    global _PADDLE_OCR, _PADDLE_OCR_USE_CLS_ARG
     image = _as_image(inputs["image"])
     if _PADDLE_OCR is None:
         try:
+            import paddleocr as paddleocr_module
             from paddleocr import PaddleOCR
         except Exception as exc:
             fallback = str(params.get("debug_text", ""))
             if fallback:
                 return NodeResult(fallback, summary=f"debug OCR {fallback}")
             raise RuntimeError("PaddleOCR is not installed. Install paddleocr and paddlepaddle.") from exc
+        major_version = int(str(getattr(paddleocr_module, "__version__", "2")).split(".", 1)[0])
         try:
+            if major_version >= 3:
+                _PADDLE_OCR = PaddleOCR(
+                    lang=str(params.get("lang", "en")),
+                    use_textline_orientation=bool(params.get("use_angle_cls", True)),
+                )
+                _PADDLE_OCR_USE_CLS_ARG = False
+            else:
+                _PADDLE_OCR = PaddleOCR(
+                    use_angle_cls=bool(params.get("use_angle_cls", True)),
+                    lang=str(params.get("lang", "en")),
+                    show_log=False,
+                )
+                _PADDLE_OCR_USE_CLS_ARG = True
+        except (TypeError, ValueError):
             _PADDLE_OCR = PaddleOCR(
-                use_angle_cls=bool(params.get("use_angle_cls", True)),
                 lang=str(params.get("lang", "en")),
-                show_log=False,
+                use_textline_orientation=bool(params.get("use_angle_cls", True)),
             )
-        except TypeError:
-            _PADDLE_OCR = PaddleOCR(lang=str(params.get("lang", "en")))
+            _PADDLE_OCR_USE_CLS_ARG = False
 
-    result = _PADDLE_OCR.ocr(image, cls=bool(params.get("use_angle_cls", True)))
+    if _PADDLE_OCR_USE_CLS_ARG:
+        result = _PADDLE_OCR.ocr(image, cls=bool(params.get("use_angle_cls", True)))
+    else:
+        result = _PADDLE_OCR.ocr(image)
     texts, scores = _collect_ocr_texts(result, float(params.get("min_score", 0.0)))
     text = str(params.get("join_with", "")).join(texts)
     if not text and params.get("debug_text"):
@@ -263,7 +281,16 @@ def build_definitions() -> dict[str, NodeDefinition]:
             _frame_capture,
             True,
         ),
-        NodeDefinition("roi", "Region of Interest", "Image", image_in, PortSpec("image", PortType.IMAGE), {"x": 0, "y": 0, "width": 100, "height": 100}, _roi, True),
+        NodeDefinition(
+            "roi",
+            "Region of Interest",
+            "Image",
+            image_in,
+            PortSpec("image", PortType.IMAGE),
+            {"x": 0, "y": 0, "width": 100, "height": 100, "live_overlay": False},
+            _roi,
+            True,
+        ),
         NodeDefinition("canny", "Canny", "Image", image_in, PortSpec("image", PortType.IMAGE), {"threshold1": 100, "threshold2": 200}, _canny, True),
         NodeDefinition("threshold", "Threshold", "Image", image_in, PortSpec("image", PortType.IMAGE), {"threshold": 165}, _threshold, True),
         NodeDefinition(
@@ -299,7 +326,7 @@ def build_default_graph(definitions: dict[str, NodeDefinition]) -> RecipeGraph:
         RecipeNode("trigger", "trigger_switch", "Trigger Switch", 40, 360),
         RecipeNode("frame", "frame_source", "Live Frame", 40, 220),
         RecipeNode("capture", "frame_capture", "Capture Snapshot", 270, 220),
-        RecipeNode("serial_roi", "roi", "Serial ROI", 500, 220, {"x": 100, "y": 240, "width": 260, "height": 120}),
+        RecipeNode("serial_roi", "roi", "Serial ROI", 500, 220, {"x": 100, "y": 240, "width": 260, "height": 120, "live_overlay": True}),
         RecipeNode("threshold", "threshold", "Threshold", 730, 220),
         RecipeNode("debug_image", "debug_image", "Debug Image", 960, 220, {"path": "debug/serial_roi.png", "save_enabled": True, "popup": False}),
         RecipeNode("ocr", "ocr", "PaddleOCR", 1190, 220, {"debug_text": "A7B9C312"}),

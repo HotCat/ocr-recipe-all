@@ -2,24 +2,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPainterPathStroker, QPen
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPainterPath, QPainterPathStroker, QPen
 from PySide6.QtWidgets import (
-    QCheckBox,
-    QComboBox,
-    QDoubleSpinBox,
-    QFormLayout,
+    QGraphicsRectItem,
     QGraphicsItem,
     QGraphicsObject,
     QGraphicsPathItem,
-    QGraphicsProxyWidget,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
     QMenu,
-    QSpinBox,
-    QLineEdit,
-    QWidget,
 )
 
 from openfrp_vision.core.events import OverlayMode
@@ -50,195 +43,23 @@ CATEGORY_COLORS = {
 }
 
 
-class CameraSettingsNodeWidget(QWidget):
-    def __init__(self, node_item: "NodeItem") -> None:
+class WorkflowGroupItem(QGraphicsRectItem):
+    def __init__(self) -> None:
         super().__init__()
-        self._node_item = node_item
-        self._block = False
-        self.setStyleSheet(
-            """
-            QWidget { background: transparent; }
-            QSpinBox {
-                background: rgba(255, 255, 255, 210);
-                color: #111827;
-                border: 1px solid rgba(30, 41, 59, 90);
-                padding: 1px;
-                min-height: 18px;
-            }
-            QCheckBox { color: #111827; font-size: 9px; }
-            """
-        )
-        layout = QFormLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        self.setZValue(-20)
+        self.setPen(QPen(QColor(255, 255, 255, 70), 1.2, Qt.PenStyle.DashLine))
+        self.setBrush(QColor(8, 13, 20, 36))
 
-        self.exposure = self._spin("exposure_us", 100, 1_000_000, 100, " us")
-        self.gamma = self._spin("gamma", 1, 500, 1, "")
-        self.contrast = self._spin("contrast", 1, 500, 1, "")
-        self.gain = self._spin("analog_gain", 0, 100, 1, "")
-        self.ae = self._check("ae_enabled", "Auto Exposure")
-        self.reverse_x = self._check("reverse_x", "Mirror X")
-        self.reverse_y = self._check("reverse_y", "Mirror Y")
-
-        layout.addRow("Exposure", self.exposure)
-        layout.addRow("Gamma", self.gamma)
-        layout.addRow("Contrast", self.contrast)
-        layout.addRow("Gain", self.gain)
-        layout.addRow(self.ae)
-        layout.addRow(self.reverse_x)
-        layout.addRow(self.reverse_y)
-
-    def _spin(self, key: str, minimum: int, maximum: int, step: int, suffix: str) -> QSpinBox:
-        spin = QSpinBox()
-        spin.setRange(minimum, maximum)
-        spin.setSingleStep(step)
-        spin.setSuffix(suffix)
-        spin.setValue(int(self._node_item.node.params.get(key, minimum)))
-        spin.valueChanged.connect(lambda value, param_key=key: self._update_param(param_key, int(value)))
-        return spin
-
-    def _check(self, key: str, label: str) -> QCheckBox:
-        check = QCheckBox(label)
-        check.setChecked(bool(self._node_item.node.params.get(key, False)))
-        check.toggled.connect(lambda value, param_key=key: self._update_param(param_key, bool(value)))
-        return check
-
-    def _update_param(self, key: str, value: int | bool) -> None:
-        if self._block:
-            return
-        self._node_item.node.params[key] = value
-        scene = self._node_item.scene()
-        if isinstance(scene, GraphScene):
-            scene.camera_settings_changed.emit(dict(self._node_item.node.params))
-            scene.message.emit("Camera parameters changed")
-
-
-class TriggerSwitchNodeWidget(QWidget):
-    def __init__(self, node_item: "NodeItem") -> None:
-        super().__init__()
-        self._node_item = node_item
-        self.setStyleSheet(
-            """
-            QWidget { background: transparent; }
-            QComboBox, QLineEdit, QSpinBox {
-                background: rgba(255, 255, 255, 210);
-                color: #111827;
-                border: 1px solid rgba(30, 41, 59, 90);
-                padding: 1px;
-                min-height: 18px;
-            }
-            QCheckBox { color: #111827; font-size: 9px; }
-            """
-        )
-        layout = QFormLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-
-        self.source = QComboBox()
-        self.source.addItems(["keyboard", "external", "manual"])
-        self.source.setCurrentText(str(node_item.node.params.get("source", "keyboard")))
-        self.source.currentTextChanged.connect(lambda value: self._update_param("source", value))
-
-        self.shortcut = QLineEdit(str(node_item.node.params.get("shortcut", "Ctrl+Return")))
-        self.shortcut.editingFinished.connect(lambda: self._update_param("shortcut", self.shortcut.text()))
-
-        self.topic = QLineEdit(str(node_item.node.params.get("external_topic", "")))
-        self.topic.editingFinished.connect(lambda: self._update_param("external_topic", self.topic.text()))
-
-        self.debounce = QSpinBox()
-        self.debounce.setRange(0, 10000)
-        self.debounce.setSuffix(" ms")
-        self.debounce.setValue(int(node_item.node.params.get("debounce_ms", 250)))
-        self.debounce.valueChanged.connect(lambda value: self._update_param("debounce_ms", int(value)))
-
-        self.armed = QCheckBox("Armed")
-        self.armed.setChecked(bool(node_item.node.params.get("armed", True)))
-        self.armed.toggled.connect(lambda value: self._update_param("armed", bool(value)))
-
-        layout.addRow("Source", self.source)
-        layout.addRow("Shortcut", self.shortcut)
-        layout.addRow("External", self.topic)
-        layout.addRow("Debounce", self.debounce)
-        layout.addRow(self.armed)
-
-    def _update_param(self, key: str, value: str | int | bool) -> None:
-        self._node_item.node.params[key] = value
-        scene = self._node_item.scene()
-        if isinstance(scene, GraphScene):
-            scene.trigger_settings_changed.emit(dict(self._node_item.node.params))
-            scene.message.emit("Trigger switch changed")
-
-
-class ParamNodeWidget(QWidget):
-    def __init__(self, node_item: "NodeItem") -> None:
-        super().__init__()
-        self._node_item = node_item
-        self.setStyleSheet(
-            """
-            QWidget { background: transparent; }
-            QSpinBox, QDoubleSpinBox, QLineEdit {
-                background: rgba(255, 255, 255, 210);
-                color: #111827;
-                border: 1px solid rgba(30, 41, 59, 90);
-                padding: 1px;
-                min-height: 18px;
-            }
-            QCheckBox { color: #111827; font-size: 9px; }
-            """
-        )
-        layout = QFormLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        for key, value in node_item.node.params.items():
-            if key == "snapshot":
-                continue
-            if isinstance(value, bool):
-                check = QCheckBox(self._label(key))
-                check.setChecked(value)
-                check.toggled.connect(lambda checked, param_key=key: self._update_param(param_key, bool(checked)))
-                layout.addRow(check)
-            elif isinstance(value, int):
-                spin = QSpinBox()
-                minimum, maximum, step = self._int_range(key)
-                spin.setRange(minimum, maximum)
-                spin.setSingleStep(step)
-                spin.setValue(value)
-                spin.valueChanged.connect(lambda number, param_key=key: self._update_param(param_key, int(number)))
-                layout.addRow(self._label(key), spin)
-            elif isinstance(value, float):
-                spin = QDoubleSpinBox()
-                spin.setRange(0.0, 1.0 if "score" in key else 1000000.0)
-                spin.setSingleStep(0.05 if "score" in key else 1.0)
-                spin.setDecimals(3 if "score" in key else 2)
-                spin.setValue(value)
-                spin.valueChanged.connect(lambda number, param_key=key: self._update_param(param_key, float(number)))
-                layout.addRow(self._label(key), spin)
-            else:
-                edit = QLineEdit(str(value))
-                edit.editingFinished.connect(lambda widget=edit, param_key=key: self._update_param(param_key, widget.text()))
-                layout.addRow(self._label(key), edit)
-
-    def _update_param(self, key: str, value: str | int | float | bool) -> None:
-        self._node_item.node.params[key] = value
-        scene = self._node_item.scene()
-        if isinstance(scene, GraphScene):
-            scene.graph.results.clear()
-            scene.graph_changed.emit()
-            scene.message.emit(f"{self._node_item.node.title} changed")
-
-    def _label(self, key: str) -> str:
-        return key.replace("_", " ").title()
-
-    def _int_range(self, key: str) -> tuple[int, int, int]:
-        if key in {"x", "y", "width", "height"}:
-            return 0, 100000, 1
-        if "threshold" in key:
-            return 0, 1000, 1
-        if "fps" in key:
-            return 1, 240, 1
-        if "exposure" in key:
-            return 1, 1000000, 100
-        return -100000, 100000, 1
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # type: ignore[no-untyped-def]
+        del option, widget
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        painter.setPen(self.pen())
+        painter.setBrush(self.brush())
+        painter.drawRoundedRect(rect, 8, 8)
+        painter.setPen(QColor(225, 235, 245, 105))
+        painter.setFont(QFont("Arial", 9, QFont.Weight.DemiBold))
+        painter.drawText(rect.adjusted(14, 10, -14, -10), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "WORKFLOW GRAPH")
 
 
 class PortItem(QGraphicsObject):
@@ -326,33 +147,12 @@ class NodeItem(QGraphicsObject):
         output_label.setFont(QFont("Arial", 8))
         output_label.setPos(self.WIDTH - output_label.boundingRect().width() - 14, 63)
 
-        self._proxy: QGraphicsProxyWidget | None = None
-        if self.node.type_name == "camera_settings":
-            self._proxy = QGraphicsProxyWidget(self)
-            self._proxy.setWidget(CameraSettingsNodeWidget(self))
-            self._proxy.setPos(14, 90)
-        elif self.node.type_name == "trigger_switch":
-            self._proxy = QGraphicsProxyWidget(self)
-            self._proxy.setWidget(TriggerSwitchNodeWidget(self))
-            self._proxy.setPos(14, 90)
-        elif self.node.params:
-            self._proxy = QGraphicsProxyWidget(self)
-            self._proxy.setWidget(ParamNodeWidget(self))
-            self._proxy.setPos(14, 90)
-
         self.summary_item = QGraphicsSimpleTextItem("Not run", self)
         self.summary_item.setBrush(QColor("#475569"))
         self.summary_item.setFont(QFont("Arial", 8))
         self.summary_item.setPos(14, self.height() - 23)
 
     def height(self) -> float:
-        if self.node.type_name == "camera_settings":
-            return 285.0
-        if self.node.type_name == "trigger_switch":
-            return 250.0
-        if self.node.params:
-            visible_params = [key for key in self.node.params if key != "snapshot"]
-            return max(self.BASE_HEIGHT, 124 + len(visible_params) * 27)
         return max(self.BASE_HEIGHT, 96 + len(self.definition.inputs) * 22)
 
     def boundingRect(self) -> QRectF:
@@ -447,7 +247,7 @@ class GraphScene(QGraphicsScene):
         self.node_items: dict[str, NodeItem] = {}
         self.edge_items: list[EdgeItem] = []
         self.pending_port: PortItem | None = None
-        self.setSceneRect(-60, -60, 1560, 760)
+        self.group_item = WorkflowGroupItem()
         self.rebuild()
 
     def add_node_at(self, type_name: str, pos: QPointF) -> str:
@@ -470,12 +270,15 @@ class GraphScene(QGraphicsScene):
         self.node_items = {}
         self.edge_items = []
         self.pending_port = None
+        self.group_item = WorkflowGroupItem()
+        self.addItem(self.group_item)
         for node_id in self.graph.nodes:
             node_item = NodeItem(self.graph, node_id)
             self.addItem(node_item)
             self.node_items[node_id] = node_item
         for edge in self.graph.edges:
             self._add_edge_item(edge)
+        self.update_group_bounds()
         self.graph_changed.emit()
 
     def _add_edge_item(self, edge: Edge) -> None:
@@ -517,6 +320,21 @@ class GraphScene(QGraphicsScene):
         for edge_item in self.edge_items:
             if edge_item.edge.source == node_id or edge_item.edge.target == node_id:
                 edge_item.update_path()
+        self.update_group_bounds()
+
+    def workflow_rect(self) -> QRectF:
+        if not self.node_items:
+            return QRectF(-300, -220, 600, 440)
+        rect = QRectF()
+        for item in self.node_items.values():
+            item_rect = item.mapRectToScene(item.boundingRect())
+            rect = item_rect if rect.isNull() else rect.united(item_rect)
+        return rect
+
+    def update_group_bounds(self) -> None:
+        rect = self.workflow_rect().adjusted(-70, -70, 70, 90)
+        self.group_item.setRect(rect)
+        self.setSceneRect(rect.adjusted(-900, -650, 900, 650))
 
     def update_results(self) -> None:
         for item in self.node_items.values():
@@ -560,12 +378,50 @@ class NodeOverlayView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._zoom = 1.0
+        self._min_zoom = 0.25
+        self._max_zoom = 2.8
+        self._panning = False
+        self._pan_start = QPoint()
+        self._space_pan = False
         self.set_overlay_mode(OverlayMode.GRAPH)
+
+    def set_graph(self, graph: RecipeGraph) -> None:
+        self.graph_scene.graph = graph
+        self.graph_scene.rebuild()
+        self.fit_to_nodes()
 
     def add_node(self, type_name: str) -> str:
         center = self.mapToScene(self.viewport().rect().center())
         return self.graph_scene.add_node_at(type_name, center)
+
+    def zoom_in(self) -> None:
+        self._scale_by(1.18)
+
+    def zoom_out(self) -> None:
+        self._scale_by(1 / 1.18)
+
+    def reset_zoom(self) -> None:
+        self.resetTransform()
+        self._zoom = 1.0
+
+    def fit_to_nodes(self) -> None:
+        rect = self.graph_scene.workflow_rect().adjusted(-120, -120, 120, 120)
+        if rect.isEmpty():
+            return
+        self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+        self._zoom = max(self._min_zoom, min(self._max_zoom, float(self.transform().m11())))
+
+    def _scale_by(self, factor: float) -> None:
+        target = max(self._min_zoom, min(self._max_zoom, self._zoom * factor))
+        if target == self._zoom:
+            return
+        actual = target / self._zoom
+        self.scale(actual, actual)
+        self._zoom = target
 
     def set_overlay_mode(self, mode: OverlayMode) -> None:
         self.setVisible(mode != OverlayMode.HIDDEN)
@@ -585,10 +441,117 @@ class NodeOverlayView(QGraphicsView):
             self.graph_scene.delete_selection()
             event.accept()
             return
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_pan = True
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.ZoomIn):
+            self.zoom_in()
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.ZoomOut):
+            self.zoom_out()
+            event.accept()
+            return
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_0:
+            self.reset_zoom()
+            event.accept()
+            return
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_F:
+            self.fit_to_nodes()
+            event.accept()
+            return
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_pan = False
+            if not self._panning:
+                self.viewport().unsetCursor()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        self._scale_by(1.15 if delta > 0 else 1 / 1.15)
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        item = self.itemAt(event.position().toPoint())
+        background_drag = event.button() == Qt.MouseButton.LeftButton and (
+            item is None or isinstance(item, WorkflowGroupItem)
+        )
+        if (
+            event.button() == Qt.MouseButton.MiddleButton
+            or (event.button() == Qt.MouseButton.LeftButton and self._space_pan)
+            or (event.button() == Qt.MouseButton.LeftButton and event.modifiers() & Qt.KeyboardModifier.AltModifier)
+            or background_drag
+        ):
+            self._panning = True
+            self._pan_start = event.position().toPoint()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._panning:
+            pos = event.position().toPoint()
+            delta = pos - self._pan_start
+            self._pan_start = pos
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._panning and event.button() in {Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton}:
+            self._panning = False
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor if self._space_pan else Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         menu = QMenu(self)
+        menu.setStyleSheet(
+            """
+            QMenu {
+                background-color: #f8fafc;
+                border: 1px solid #94a3b8;
+                color: #0f172a;
+                padding: 5px;
+            }
+            QMenu::item {
+                background-color: transparent;
+                color: #0f172a;
+                padding: 6px 26px 6px 12px;
+                min-width: 220px;
+            }
+            QMenu::item:selected {
+                background-color: #dbeafe;
+                color: #0f172a;
+            }
+            QMenu::item:disabled {
+                color: #94a3b8;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #cbd5e1;
+                margin: 5px 8px;
+            }
+            QMenu::right-arrow {
+                width: 8px;
+                height: 8px;
+            }
+            """
+        )
         add_menu = menu.addMenu("Add Node")
         scene_pos = self.mapToScene(event.pos())
         for type_name, definition in sorted(self.graph_scene.graph.definitions.items(), key=lambda item: (item[1].category, item[1].title)):
