@@ -26,21 +26,24 @@ def _run_ocr(image_path: Path, params: dict[str, Any]) -> dict[str, Any]:
 
     major_version = int(str(getattr(paddleocr_module, "__version__", "2")).split(".", 1)[0])
     lang = str(params.get("lang", "en"))
+    ocr_version = str(params.get("ocr_version", "PP-OCRv3"))
     use_angle_cls = bool(params.get("use_angle_cls", True))
     key = (
         major_version,
         lang,
+        ocr_version,
         use_angle_cls,
         bool(params.get("enable_mkldnn", False)),
         bool(params.get("ir_optim", False)),
     )
     if _OCR is None or _OCR_KEY != key:
         if major_version >= 3:
-            _OCR = PaddleOCR(lang=lang, use_textline_orientation=use_angle_cls)
+            _OCR = PaddleOCR(lang=lang, ocr_version=ocr_version, use_textline_orientation=use_angle_cls)
         else:
             _OCR = PaddleOCR(
                 use_angle_cls=use_angle_cls,
                 lang=lang,
+                ocr_version=ocr_version,
                 show_log=False,
                 use_gpu=False,
                 enable_mkldnn=bool(params.get("enable_mkldnn", False)),

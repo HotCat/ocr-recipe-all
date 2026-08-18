@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from openfrp_vision.core.i18n import category_label, node_label, node_type_label, param_label, tr
 from openfrp_vision.ui.camera_preview import CameraGLView
 from openfrp_vision.workflow.model import RecipeGraph
 
@@ -109,9 +110,9 @@ class NodeInspector(QWidget):
         layout.setSpacing(8)
 
         header = QHBoxLayout()
-        self.section_label = QLabel("INSPECTOR")
+        self.section_label = QLabel()
         self.section_label.setObjectName("sectionTitle")
-        self.roi_button = QPushButton("Pick ROI")
+        self.roi_button = QPushButton()
         self.roi_button.setVisible(False)
         self.roi_button.clicked.connect(self._request_roi)
         header.addWidget(self.section_label)
@@ -119,7 +120,7 @@ class NodeInspector(QWidget):
         header.addWidget(self.roi_button)
         layout.addLayout(header)
 
-        self.node_title = QLabel("No node selected")
+        self.node_title = QLabel()
         self.node_title.setObjectName("nodeTitle")
         self.node_title.setWordWrap(True)
         self.node_meta = QLabel("")
@@ -127,7 +128,7 @@ class NodeInspector(QWidget):
         self.node_meta.setWordWrap(True)
         layout.addWidget(self.node_title)
         layout.addWidget(self.node_meta)
-        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check = QCheckBox()
         self.enabled_check.toggled.connect(self._enabled_changed)
         layout.addWidget(self.enabled_check)
 
@@ -135,9 +136,9 @@ class NodeInspector(QWidget):
         rule.setObjectName("rule")
         layout.addWidget(rule)
 
-        params_title = QLabel("PARAMETERS")
-        params_title.setObjectName("sectionTitle")
-        layout.addWidget(params_title)
+        self.params_title = QLabel()
+        self.params_title.setObjectName("sectionTitle")
+        layout.addWidget(self.params_title)
 
         self.parameter_widget = QWidget()
         self.parameter_form = QFormLayout(self.parameter_widget)
@@ -150,47 +151,63 @@ class NodeInspector(QWidget):
         parameter_scroll.setWidget(self.parameter_widget)
         layout.addWidget(parameter_scroll, 1)
 
-        preview_title = QLabel("PREVIEW")
-        preview_title.setObjectName("sectionTitle")
-        layout.addWidget(preview_title)
-        self.preview = QLabel("No preview")
+        self.preview_title = QLabel()
+        self.preview_title.setObjectName("sectionTitle")
+        layout.addWidget(self.preview_title)
+        self.preview = QLabel()
         self.preview.setObjectName("preview")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setMinimumHeight(150)
         self.preview.setScaledContents(False)
         layout.addWidget(self.preview)
 
-        output_title = QLabel("OUTPUT")
-        output_title.setObjectName("sectionTitle")
-        layout.addWidget(output_title)
+        self.output_title = QLabel()
+        self.output_title.setObjectName("sectionTitle")
+        layout.addWidget(self.output_title)
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.output.setMaximumHeight(130)
-        self.output.setPlaceholderText("Run workflow to inspect output")
+        self.retranslate()
         layout.addWidget(self.output)
 
     def set_graph(self, graph: RecipeGraph) -> None:
         self.graph = graph
         self.inspect(None)
 
+    def retranslate(self) -> None:
+        self.section_label.setText(tr("inspector.title"))
+        self.roi_button.setText(tr("inspector.pick_roi"))
+        self.enabled_check.setText(tr("inspector.enabled"))
+        self.params_title.setText(tr("inspector.parameters"))
+        self.preview_title.setText(tr("inspector.preview"))
+        self.output_title.setText(tr("inspector.output"))
+        self.output.setPlaceholderText(tr("inspector.output_placeholder"))
+        self.inspect(self.current_node_id)
+
     def inspect(self, node_id: str | None) -> None:
         self.current_node_id = node_id if node_id in self.graph.nodes else None
         self._clear_form()
         if self.current_node_id is None:
-            self.node_title.setText("No node selected")
-            self.node_meta.setText("Select a node to edit profile-scoped parameters.")
+            self.node_title.setText(tr("inspector.no_node"))
+            self.node_meta.setText(tr("inspector.no_node_hint"))
             self.enabled_check.setVisible(False)
             self.roi_button.setVisible(False)
             self.preview.setPixmap(QPixmap())
-            self.preview.setText("No preview")
+            self.preview.setText(tr("inspector.no_preview"))
             self.output.clear()
             return
 
         node = self.graph.nodes[self.current_node_id]
         definition = self.graph.definitions[node.type_name]
-        self.node_title.setText(node.title)
-        state = "enabled" if node.enabled else "disabled"
-        self.node_meta.setText(f"{definition.category} / {definition.title} / {state} / revision {self.graph.revision}")
+        self.node_title.setText(node_label(node, definition.title))
+        state = tr("state.enabled") if node.enabled else tr("state.disabled")
+        meta = (
+            f"{category_label(definition.category)} / "
+            f"{node_type_label(node.type_name, definition.title)} / "
+            f"{state} / "
+            f"{tr('inspector.revision', revision=self.graph.revision)}"
+        )
+        self.node_meta.setText(meta)
         blocked = self.enabled_check.blockSignals(True)
         self.enabled_check.setChecked(node.enabled)
         self.enabled_check.blockSignals(blocked)
@@ -203,7 +220,7 @@ class NodeInspector(QWidget):
             self._parameter_widgets[key] = widget
             self.parameter_form.addRow(self._label(key), widget)
         if not self._parameter_widgets:
-            self.parameter_form.addRow(QLabel("No editable parameters"))
+            self.parameter_form.addRow(QLabel(tr("inspector.no_params")))
         self.refresh_result()
 
     def refresh_result(self) -> None:
@@ -213,7 +230,7 @@ class NodeInspector(QWidget):
         result = self.graph.results.get(self.current_node_id)
         if result is None:
             self.preview.setPixmap(QPixmap())
-            self.preview.setText("No preview")
+            self.preview.setText(tr("inspector.no_preview"))
             self.output.clear()
             return
 
@@ -221,7 +238,7 @@ class NodeInspector(QWidget):
             qimage = CameraGLView._to_qimage(result.preview)
             if qimage.isNull():
                 self.preview.setPixmap(QPixmap())
-                self.preview.setText("No preview")
+                self.preview.setText(tr("inspector.no_preview"))
             else:
                 pixmap = QPixmap.fromImage(qimage)
                 self.preview.setText("")
@@ -235,7 +252,7 @@ class NodeInspector(QWidget):
                 )
         else:
             self.preview.setPixmap(QPixmap())
-            self.preview.setText("No preview")
+            self.preview.setText(tr("inspector.no_preview"))
 
         value = result.value
         if isinstance(value, np.ndarray):
@@ -438,6 +455,8 @@ class NodeInspector(QWidget):
             return ["en", "ch"]
         if node_type == "ocr" and key == "run_mode":
             return ["worker", "subprocess_once", "in_process"]
+        if node_type == "ocr" and key == "ocr_version":
+            return ["PP-OCRv3", "PP-OCRv4"]
         return []
 
     def _int_range(self, node_type: str, key: str) -> tuple[int, int, int, str]:
@@ -463,7 +482,7 @@ class NodeInspector(QWidget):
         return -1_000_000.0, 1_000_000.0, 1.0, 3
 
     def _label(self, key: str) -> str:
-        return key.replace("_", " ").title()
+        return param_label(key)
 
     def _image_summary(self, image: np.ndarray) -> str:
         shape = " x ".join(str(part) for part in image.shape)

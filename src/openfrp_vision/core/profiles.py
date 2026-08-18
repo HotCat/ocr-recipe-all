@@ -13,6 +13,12 @@ from openfrp_vision.workflow.model import RecipeGraph
 CONFIG_FORMAT = "openfrp-vision/profiles/v1"
 DEFAULT_PROFILE_ID = "default"
 DEFAULT_PROFILE_NAME = "Default Product"
+DEFAULT_LANGUAGE = "en"
+DEFAULT_INDICATOR_SETTINGS = {
+    "blink_interval_s": 0.2,
+    "blink_duration_s": 2.0,
+    "geometry": [24, 72, 260, 190],
+}
 
 
 def default_config_path() -> Path:
@@ -45,12 +51,13 @@ class ProfileStore:
     def load(cls, path: Path | None = None) -> "ProfileStore":
         config_path = path or default_config_path()
         if not config_path.exists():
-            return cls(config_path, {"format": CONFIG_FORMAT, "active_profile": DEFAULT_PROFILE_ID, "profiles": {}})
+            return cls(config_path, {"format": CONFIG_FORMAT, "active_profile": DEFAULT_PROFILE_ID, "language": DEFAULT_LANGUAGE, "profiles": {}})
 
         data = json.loads(config_path.read_text(encoding="utf-8"))
         if data.get("format") != CONFIG_FORMAT:
             raise ValueError(f"Unsupported profile config format: {data.get('format')}")
         data.setdefault("active_profile", DEFAULT_PROFILE_ID)
+        data.setdefault("language", DEFAULT_LANGUAGE)
         data.setdefault("profiles", {})
         return cls(config_path, data)
 
@@ -75,6 +82,14 @@ class ProfileStore:
         ids = self.profile_ids()
         return ids[0] if ids else DEFAULT_PROFILE_ID
 
+    def language(self) -> str:
+        language = str(self.data.get("language") or DEFAULT_LANGUAGE)
+        return language if language in {"en", "zh_CN"} else DEFAULT_LANGUAGE
+
+    def set_language(self, language: str) -> None:
+        self.data["language"] = language if language in {"en", "zh_CN"} else DEFAULT_LANGUAGE
+        self.save()
+
     def active_graph_data(self) -> dict[str, Any] | None:
         return self.graph_data(self.active_profile_id())
 
@@ -85,24 +100,34 @@ class ProfileStore:
         graph = profile.get("graph")
         return graph if isinstance(graph, dict) else None
 
+    def indicator_settings(self, profile_id: str) -> dict[str, Any]:
+        profile = self.data.get("profiles", {}).get(profile_id)
+        if not isinstance(profile, dict):
+            return dict(DEFAULT_INDICATOR_SETTINGS)
+        settings = profile.get("indicator")
+        if not isinstance(settings, dict):
+            return dict(DEFAULT_INDICATOR_SETTINGS)
+        return {**DEFAULT_INDICATOR_SETTINGS, **settings}
+
     def set_active(self, profile_id: str) -> None:
         if profile_id not in self.data.get("profiles", {}):
             raise KeyError(profile_id)
         self.data["active_profile"] = profile_id
         self.save()
 
-    def save_profile(self, profile_id: str, graph: RecipeGraph, name: str | None = None) -> None:
+    def save_profile(self, profile_id: str, graph: RecipeGraph, name: str | None = None, indicator: dict[str, Any] | None = None) -> None:
         profiles = self.data.setdefault("profiles", {})
         current = profiles.get(profile_id, {})
         display_name = name or str(current.get("name") or profile_id)
-        profiles[profile_id] = self._profile_payload(display_name, graph)
+        indicator_settings = indicator or self.indicator_settings(profile_id)
+        profiles[profile_id] = self._profile_payload(display_name, graph, indicator_settings)
         self.data["active_profile"] = profile_id
         self.save()
 
-    def create_profile(self, name: str, graph: RecipeGraph) -> str:
+    def create_profile(self, name: str, graph: RecipeGraph, indicator: dict[str, Any] | None = None) -> str:
         profiles = self.data.setdefault("profiles", {})
         profile_id = _profile_id(name, set(profiles.keys()))
-        profiles[profile_id] = self._profile_payload(name.strip() or profile_id, graph)
+        profiles[profile_id] = self._profile_payload(name.strip() or profile_id, graph, indicator or DEFAULT_INDICATOR_SETTINGS)
         self.data["active_profile"] = profile_id
         self.save()
         return profile_id
@@ -111,9 +136,10 @@ class ProfileStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
 
-    def _profile_payload(self, name: str, graph: RecipeGraph) -> dict[str, Any]:
+    def _profile_payload(self, name: str, graph: RecipeGraph, indicator: dict[str, Any] | None = None) -> dict[str, Any]:
         return {
             "name": name,
             "updated_at": _now_iso(),
             "graph": graph.to_dict(),
+            "indicator": {**DEFAULT_INDICATOR_SETTINGS, **(indicator or {})},
         }

@@ -329,6 +329,7 @@ def _paddle_ocr_in_process(image: Any, params: dict[str, Any]) -> NodeResult:
             if major_version >= 3:
                 _PADDLE_OCR = PaddleOCR(
                     lang=str(params.get("lang", "en")),
+                    ocr_version=str(params.get("ocr_version", "PP-OCRv3")),
                     use_textline_orientation=bool(params.get("use_angle_cls", True)),
                 )
                 _PADDLE_OCR_USE_CLS_ARG = False
@@ -336,6 +337,7 @@ def _paddle_ocr_in_process(image: Any, params: dict[str, Any]) -> NodeResult:
                 _PADDLE_OCR = PaddleOCR(
                     use_angle_cls=bool(params.get("use_angle_cls", True)),
                     lang=str(params.get("lang", "en")),
+                    ocr_version=str(params.get("ocr_version", "PP-OCRv3")),
                     show_log=False,
                     use_gpu=False,
                     enable_mkldnn=bool(params.get("enable_mkldnn", False)),
@@ -345,6 +347,7 @@ def _paddle_ocr_in_process(image: Any, params: dict[str, Any]) -> NodeResult:
         except (TypeError, ValueError):
             _PADDLE_OCR = PaddleOCR(
                 lang=str(params.get("lang", "en")),
+                ocr_version=str(params.get("ocr_version", "PP-OCRv3")),
                 use_textline_orientation=bool(params.get("use_angle_cls", True)),
             )
             _PADDLE_OCR_USE_CLS_ARG = False
@@ -384,36 +387,58 @@ class _PaddleWorkerClient:
 
     def run(self, image_path: Path, params: dict[str, Any], timeout_s: float) -> dict[str, Any]:
         with self._lock:
-            process = self._ensure_process()
-            self._request_id += 1
-            request_id = str(self._request_id)
-            payload = json.dumps({"id": request_id, "image_path": str(image_path), "params": params}, ensure_ascii=False)
-            assert process.stdin is not None
-            assert process.stdout is not None
-            try:
-                process.stdin.write(payload + "\n")
-                process.stdin.flush()
-            except (BrokenPipeError, OSError):
-                return self._crash_result(process)
-
-            deadline = time.monotonic() + timeout_s
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    return self._crash_result(process)
-                ready, _, _ = select.select([process.stdout], [], [], min(0.1, max(0.0, deadline - time.monotonic())))
-                if not ready:
-                    continue
-                line = process.stdout.readline()
-                if not line:
-                    return self._crash_result(process)
-                if not line.startswith(_PADDLE_WORKER_PREFIX):
-                    continue
-                result = json.loads(line[len(_PADDLE_WORKER_PREFIX) :])
-                if str(result.get("id", request_id)) == request_id:
+            restart_attempts = max(0, int(params.get("restart_attempts", 1)))
+            crash_errors: list[str] = []
+            for attempt in range(restart_attempts + 1):
+                result = self._run_once(image_path, params, timeout_s)
+                if not result.pop("_restartable", False):
+                    if crash_errors and result.get("ok", False):
+                        result["worker_restarts"] = len(crash_errors)
+                        result["restart_errors"] = crash_errors
                     return result
 
-            self.stop()
-            return {"ok": False, "error": "PaddleOCR worker timeout"}
+                crash_errors.append(str(result.get("error", "PaddleOCR worker crashed")))
+                if attempt < restart_attempts:
+                    continue
+
+                result["worker_restarts"] = len(crash_errors) - 1
+                result["restart_errors"] = crash_errors
+                result["error"] = f"{crash_errors[-1]} (restart attempts exhausted)"
+                return result
+
+            return {"ok": False, "error": "PaddleOCR worker failed"}
+
+    def _run_once(self, image_path: Path, params: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        process = self._ensure_process(params)
+        self._request_id += 1
+        request_id = str(self._request_id)
+        payload = json.dumps({"id": request_id, "image_path": str(image_path), "params": params}, ensure_ascii=False)
+        assert process.stdin is not None
+        assert process.stdout is not None
+        try:
+            process.stdin.write(payload + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return self._crash_result(process)
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                return self._crash_result(process)
+            ready, _, _ = select.select([process.stdout], [], [], min(0.1, max(0.0, deadline - time.monotonic())))
+            if not ready:
+                continue
+            line = process.stdout.readline()
+            if not line:
+                return self._crash_result(process)
+            if not line.startswith(_PADDLE_WORKER_PREFIX):
+                continue
+            result = json.loads(line[len(_PADDLE_WORKER_PREFIX) :])
+            if str(result.get("id", request_id)) == request_id:
+                return result
+
+        self.stop()
+        return {"ok": False, "error": "PaddleOCR worker timeout"}
 
     def stop(self) -> None:
         process = self._process
@@ -426,10 +451,11 @@ class _PaddleWorkerClient:
         except Exception:
             try:
                 process.kill()
+                process.wait(timeout=1)
             except Exception:
                 pass
 
-    def _ensure_process(self) -> subprocess.Popen[str]:
+    def _ensure_process(self, params: dict[str, Any]) -> subprocess.Popen[str]:
         if self._process is not None and self._process.poll() is None:
             return self._process
         self._process = subprocess.Popen(
@@ -439,14 +465,32 @@ class _PaddleWorkerClient:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            env={**os.environ, "OMP_NUM_THREADS": "1"},
+            env={**os.environ, "OMP_NUM_THREADS": str(params.get("threads", 1))},
         )
         return self._process
 
     def _crash_result(self, process: subprocess.Popen[str]) -> dict[str, Any]:
         code = process.poll()
-        self._process = None
-        return {"ok": False, "error": f"PaddleOCR worker crashed: {_signal_name(code or -1)}"}
+        self._discard_process(process)
+        if code is None:
+            code = process.returncode
+        return {"ok": False, "error": f"PaddleOCR worker crashed: {_signal_name(code or -1)}", "_restartable": True}
+
+    def _discard_process(self, process: subprocess.Popen[str]) -> None:
+        if self._process is process:
+            self._process = None
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=1)
+            else:
+                process.wait(timeout=0.1)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except Exception:
+                pass
 
 
 def _paddle_ocr_subprocess_once(image: Any, params: dict[str, Any]) -> NodeResult:
@@ -559,7 +603,10 @@ def _paddle_ocr_worker(image: Any, params: dict[str, Any]) -> NodeResult:
     score_summary = f" {max(float(score) for score in scores):.2f}" if scores else ""
     count = int(result.get("count", 0) or 0)
     prefix = f"OCR {count}" if count else "OCR"
-    return NodeResult(text, preview=preview, summary=f"{prefix}: {(text or 'no text')[:32]}{score_summary}")
+    restart_count = int(result.get("worker_restarts", 0) or 0)
+    restart_word = "restart" if restart_count == 1 else "restarts"
+    restart_summary = f" after {restart_count} {restart_word}" if restart_count else ""
+    return NodeResult(text, preview=preview, summary=f"{prefix}{restart_summary}: {(text or 'no text')[:32]}{score_summary}")
 
 
 def _paddle_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
@@ -761,9 +808,11 @@ def build_definitions() -> dict[str, NodeDefinition]:
             PortSpec("text", PortType.TEXT),
             {
                 "lang": "en",
+                "ocr_version": "PP-OCRv3",
                 "run_mode": "worker",
                 "timeout_s": 60,
                 "threads": 1,
+                "restart_attempts": 1,
                 "use_angle_cls": True,
                 "min_score": 0.0,
                 "join_with": "",

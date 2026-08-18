@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from openfrp_vision.core.events import OverlayMode
+from openfrp_vision.core.i18n import category_label, node_label, node_type_label, port_label, tr
 from openfrp_vision.workflow.model import Edge, GraphError, PortType, RecipeGraph, RecipeNode
 
 if TYPE_CHECKING:
@@ -59,7 +60,7 @@ class WorkflowGroupItem(QGraphicsRectItem):
         painter.drawRoundedRect(rect, 8, 8)
         painter.setPen(QColor(225, 235, 245, 105))
         painter.setFont(QFont("Arial", 9, QFont.Weight.DemiBold))
-        painter.drawText(rect.adjusted(14, 10, -14, -10), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "WORKFLOW GRAPH")
+        painter.drawText(rect.adjusted(14, 10, -14, -10), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, tr("graph.group"))
 
 
 class PortItem(QGraphicsObject):
@@ -74,7 +75,7 @@ class PortItem(QGraphicsObject):
         self.pending = False
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setToolTip(f"{port_name}: {data_type.value}")
+        self.setToolTip(f"{port_label(port_name)}: {data_type.value}")
 
     def boundingRect(self) -> QRectF:
         radius = self.RADIUS + 3
@@ -121,12 +122,12 @@ class NodeItem(QGraphicsObject):
         )
         self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
 
-        title = QGraphicsSimpleTextItem(self.node.title, self)
+        title = QGraphicsSimpleTextItem(node_label(self.node, self.definition.title), self)
         title.setBrush(QColor("#ffffff"))
         title.setFont(QFont("Arial", 10, QFont.Weight.DemiBold))
         title.setPos(14, 8)
 
-        subtitle = QGraphicsSimpleTextItem(self.definition.title, self)
+        subtitle = QGraphicsSimpleTextItem(node_type_label(self.node.type_name, self.definition.title), self)
         subtitle.setBrush(QColor("#5b6570"))
         subtitle.setFont(QFont("Arial", 8))
         subtitle.setPos(14, 42)
@@ -135,19 +136,19 @@ class NodeItem(QGraphicsObject):
             item = PortItem(self, port.name, port.data_type, False)
             item.setPos(0, 70 + index * 22)
             self.input_ports[port.name] = item
-            label = QGraphicsSimpleTextItem(port.name, self)
+            label = QGraphicsSimpleTextItem(port_label(port.name), self)
             label.setBrush(QColor("#334155"))
             label.setFont(QFont("Arial", 8))
             label.setPos(14, 63 + index * 22)
 
         self.output_port = PortItem(self, self.definition.output.name, self.definition.output.data_type, True)
         self.output_port.setPos(self.WIDTH, 70)
-        output_label = QGraphicsSimpleTextItem(self.definition.output.name, self)
+        output_label = QGraphicsSimpleTextItem(port_label(self.definition.output.name), self)
         output_label.setBrush(QColor("#334155"))
         output_label.setFont(QFont("Arial", 8))
         output_label.setPos(self.WIDTH - output_label.boundingRect().width() - 14, 63)
 
-        self.summary_item = QGraphicsSimpleTextItem("Not run", self)
+        self.summary_item = QGraphicsSimpleTextItem(tr("graph.not_run"), self)
         self.summary_item.setBrush(QColor("#475569"))
         self.summary_item.setFont(QFont("Arial", 8))
         self.summary_item.setPos(14, self.height() - 23)
@@ -198,13 +199,13 @@ class NodeItem(QGraphicsObject):
 
     def update_result(self) -> None:
         if not self.node.enabled:
-            self.summary_item.setText("Disabled")
+            self.summary_item.setText(tr("graph.disabled"))
             self.summary_item.setBrush(QColor("#334155"))
             self.update()
             return
         result = self.graph.results.get(self.node_id)
         if result is None:
-            self.summary_item.setText("Not run")
+            self.summary_item.setText(tr("graph.not_run"))
             self.summary_item.setBrush(QColor("#475569"))
         else:
             summary = result.summary.replace("\n", " ")
@@ -280,7 +281,7 @@ class GraphScene(QGraphicsScene):
         self.graph.add_node(node)
         self.graph.results.clear()
         self.rebuild()
-        self.message.emit(f"Added {definition.title}")
+        self.message.emit(tr("graph.added", node=node_type_label(type_name, definition.title)))
         return node_id
 
     def rebuild(self) -> None:
@@ -311,7 +312,7 @@ class GraphScene(QGraphicsScene):
             self.pending_port = port
             port.pending = True
             port.update()
-            self.message.emit(f"Connect {port.data_type.value} port")
+            self.message.emit(tr("graph.connect_port", port=port.data_type.value))
             return
 
         first = self.pending_port
@@ -319,10 +320,10 @@ class GraphScene(QGraphicsScene):
         first.update()
         self.pending_port = None
         if first is port:
-            self.message.emit("Connection cancelled")
+            self.message.emit(tr("graph.connection_cancelled"))
             return
         if first.is_output == port.is_output:
-            self.message.emit("Choose one output and one input port")
+            self.message.emit(tr("graph.choose_ports"))
             return
         source = first if first.is_output else port
         target = port if first.is_output else first
@@ -332,7 +333,7 @@ class GraphScene(QGraphicsScene):
             self.message.emit(str(exc))
             return
         self.rebuild()
-        self.message.emit("Connection added")
+        self.message.emit(tr("graph.connection_added"))
 
     def update_edges_for(self, node_id: str) -> None:
         for edge_item in self.edge_items:
@@ -369,7 +370,7 @@ class GraphScene(QGraphicsScene):
         if edge_values or node_ids:
             self.graph.results.clear()
             self.rebuild()
-            self.message.emit("Selection deleted")
+            self.message.emit(tr("graph.selection_deleted"))
 
     def set_selection_enabled(self, enabled: bool) -> None:
         node_ids = [item.node_id for item in self.selectedItems() if isinstance(item, NodeItem)]
@@ -382,9 +383,9 @@ class GraphScene(QGraphicsScene):
             item = self.node_items.get(node_id)
             if item is not None:
                 item.update()
-        state = "enabled" if enabled else "disabled"
+        state = tr("state.enabled") if enabled else tr("state.disabled")
         self.graph_changed.emit()
-        self.message.emit(f"{len(node_ids)} node(s) {state}")
+        self.message.emit(tr("graph.nodes_enabled", count=len(node_ids), state=state))
 
     def toggle_selection_enabled(self) -> None:
         node_ids = [item.node_id for item in self.selectedItems() if isinstance(item, NodeItem)]
@@ -396,14 +397,14 @@ class GraphScene(QGraphicsScene):
     def update_roi_node(self, node_id: str, roi: tuple[int, int, int, int]) -> None:
         node = self.graph.nodes.get(node_id)
         if node is None or node.type_name != "roi":
-            self.message.emit("Select or create an ROI node first")
+            self.message.emit(tr("graph.select_roi_first"))
             return
         x, y, width, height = roi
         node.params.update({"x": x, "y": y, "width": width, "height": height})
         self.graph.results.clear()
         self.graph.revision += 1
         self.rebuild()
-        self.message.emit(f"{node.title}: x={x}, y={y}, {width} x {height}")
+        self.message.emit(tr("status.roi_changed", node=node_label(node, self.graph.definitions[node.type_name].title), x=x, y=y, width=width, height=height))
 
 
 class NodeOverlayView(QGraphicsView):
@@ -433,6 +434,9 @@ class NodeOverlayView(QGraphicsView):
         self.graph_scene.graph = graph
         self.graph_scene.rebuild()
         self.fit_to_nodes()
+
+    def retranslate(self) -> None:
+        self.graph_scene.rebuild()
 
     def add_node(self, type_name: str) -> str:
         center = self.mapToScene(self.viewport().rect().center())
@@ -609,15 +613,15 @@ class NodeOverlayView(QGraphicsView):
         ]
         if selected_nodes:
             if any(not self.graph_scene.graph.nodes[node_id].enabled for node_id in selected_nodes):
-                menu.addAction("Enable Selected Node(s)", lambda _checked=False: self.graph_scene.set_selection_enabled(True))
+                menu.addAction(tr("menu.enable_selected"), lambda _checked=False: self.graph_scene.set_selection_enabled(True))
             if any(self.graph_scene.graph.nodes[node_id].enabled for node_id in selected_nodes):
-                menu.addAction("Disable Selected Node(s)", lambda _checked=False: self.graph_scene.set_selection_enabled(False))
-            menu.addAction("Toggle Selected Node(s)", self.graph_scene.toggle_selection_enabled)
+                menu.addAction(tr("menu.disable_selected"), lambda _checked=False: self.graph_scene.set_selection_enabled(False))
+            menu.addAction(tr("menu.toggle_selected"), self.graph_scene.toggle_selection_enabled)
             menu.addSeparator()
-        add_menu = menu.addMenu("Add Node")
+        add_menu = menu.addMenu(tr("menu.add_node"))
         scene_pos = self.mapToScene(event.pos())
         for type_name, definition in sorted(self.graph_scene.graph.definitions.items(), key=lambda item: (item[1].category, item[1].title)):
-            action = add_menu.addAction(f"{definition.category}: {definition.title}")
+            action = add_menu.addAction(f"{category_label(definition.category)}: {node_type_label(type_name, definition.title)}")
             action.triggered.connect(lambda _checked=False, node_type=type_name: self.graph_scene.add_node_at(node_type, scene_pos))
-        menu.addAction("Delete Selection", self.graph_scene.delete_selection)
+        menu.addAction(tr("menu.delete_selection"), self.graph_scene.delete_selection)
         menu.exec(event.globalPos())
