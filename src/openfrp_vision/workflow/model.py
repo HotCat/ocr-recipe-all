@@ -31,6 +31,7 @@ class NodeResult:
     preview: Any = None
     summary: str = ""
     elapsed_ms: float = 0.0
+    skipped: bool = False
 
 
 Processor = Callable[[dict[str, Any], dict[str, Any]], NodeResult]
@@ -56,6 +57,7 @@ class RecipeNode:
     x: float
     y: float
     params: dict[str, Any] = field(default_factory=dict)
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,13 @@ class RecipeGraph:
             self.nodes.pop(node_id, None)
             self.edges = [edge for edge in self.edges if edge.source != node_id and edge.target != node_id]
             self.results.pop(node_id, None)
+            self.revision += 1
+
+    def set_node_enabled(self, node_id: str, enabled: bool) -> None:
+        node = self.nodes.get(node_id)
+        if node is not None and node.enabled != enabled:
+            node.enabled = enabled
+            self.results.clear()
             self.revision += 1
 
     def connect(self, source: str, target: str, target_port: str) -> None:
@@ -159,6 +168,8 @@ class RecipeGraph:
         except GraphError as exc:
             errors.append(str(exc))
         for node in self.nodes.values():
+            if not node.enabled:
+                continue
             definition = self.definitions[node.type_name]
             for port in definition.inputs:
                 incoming = [edge for edge in self.edges if edge.target == node.node_id and edge.target_port == port.name]
@@ -176,12 +187,31 @@ class RecipeGraph:
         results: dict[str, NodeResult] = {}
         for node_id in self.topological_order():
             node = self.nodes[node_id]
+            if not node.enabled:
+                results[node_id] = NodeResult(None, summary="DISABLED", skipped=True)
+                continue
             definition = self.definitions[node.type_name]
             inputs: dict[str, Any] = {}
+            skip_reason = ""
             for port in definition.inputs:
                 incoming = [edge for edge in self.edges if edge.target == node_id and edge.target_port == port.name]
-                values = [results[edge.source].value for edge in incoming]
-                inputs[port.name] = values if port.multiple else values[0]
+                source_results = [results[edge.source] for edge in incoming]
+                values = [result.value for result in source_results if not result.skipped]
+                if port.required and not values:
+                    skipped_sources = [edge.source for edge, result in zip(incoming, source_results) if result.skipped]
+                    suffix = f" from {', '.join(skipped_sources)}" if skipped_sources else ""
+                    skip_reason = f"SKIPPED missing {port.name}{suffix}"
+                    break
+                if port.multiple:
+                    inputs[port.name] = values
+                elif values:
+                    inputs[port.name] = values[0]
+                else:
+                    inputs[port.name] = None
+
+            if skip_reason:
+                results[node_id] = NodeResult(None, summary=skip_reason, skipped=True)
+                continue
 
             started = perf_counter()
             result = definition.processor(inputs, dict(node.params))
@@ -200,6 +230,7 @@ class RecipeGraph:
                     "type": node.type_name,
                     "title": node.title,
                     "position": [node.x, node.y],
+                    "enabled": node.enabled,
                     "params": {key: copy.deepcopy(value) for key, value in node.params.items() if key != "snapshot"},
                 }
                 for node in self.nodes.values()
@@ -222,7 +253,8 @@ class RecipeGraph:
             title = str(item.get("title") or definitions[type_name].title)
             position = item.get("position", [0, 0])
             params = dict(item.get("params", {}))
-            graph.add_node(RecipeNode(node_id, type_name, title, float(position[0]), float(position[1]), params))
+            enabled = bool(item.get("enabled", True))
+            graph.add_node(RecipeNode(node_id, type_name, title, float(position[0]), float(position[1]), params, enabled))
 
         for item in data.get("edges", []):
             graph.connect(str(item["source"]), str(item["target"]), str(item["target_port"]))

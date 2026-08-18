@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 
 import numpy as np
 
@@ -29,7 +30,7 @@ from openfrp_vision.ui.node_overlay import NodeOverlayView
 from openfrp_vision.ui.roi_overlay import RoiHandleWidget
 from openfrp_vision.workflow.executor import WorkflowExecutor, WorkflowRun
 from openfrp_vision.workflow.model import GraphError, RecipeGraph
-from openfrp_vision.workflow.nodes import build_default_graph, build_definitions
+from openfrp_vision.workflow.nodes import build_default_graph, build_definitions, shutdown_paddle_worker, warm_paddle_worker
 
 
 class CameraWorkbench(QWidget):
@@ -167,7 +168,7 @@ class CameraWorkbench(QWidget):
         enabled_nodes = {
             node_id: node
             for node_id, node in graph.nodes.items()
-            if node.type_name == "roi" and bool(node.params.get("live_overlay", False))
+            if node.enabled and node.type_name == "roi" and bool(node.params.get("live_overlay", False))
         }
         for node_id in list(self.roi_overlays):
             if node_id not in enabled_nodes:
@@ -242,6 +243,7 @@ class MainWindow(QMainWindow):
         self.workbench.overlay.graph_scene.trigger_settings_changed.connect(lambda _params: self._configure_trigger_action())
         self.workbench.overlay.graph_scene.selectionChanged.connect(self._selection_changed)
         self.workbench.inspector.parameter_changed.connect(self._inspector_parameter_changed)
+        self.workbench.inspector.node_enabled_changed.connect(self._inspector_node_enabled_changed)
         self.workbench.inspector.request_roi.connect(self._start_roi_selection)
         self.workbench.roi_overlay_changed.connect(self._roi_overlay_changed)
         self.workflow_done.connect(self._workflow_finished)
@@ -256,6 +258,7 @@ class MainWindow(QMainWindow):
         self.addAction(self._run_action)
         self._configure_trigger_action()
         self._apply_active_profile_camera_settings()
+        QTimer.singleShot(0, self._warm_active_profile_ocr)
 
         overlay_action = QAction("Toggle Overlay", self)
         overlay_action.setShortcut(QKeySequence("Tab"))
@@ -280,6 +283,9 @@ class MainWindow(QMainWindow):
     def _graph_changed(self) -> None:
         self._configure_trigger_action()
         self._sync_roi_overlays()
+        current = self.workbench.inspector.current_node_id
+        if current in self.graph.nodes:
+            self.workbench.inspector.inspect(current)
 
     def _populate_profiles(self) -> None:
         profiles = [(profile_id, self.profile_store.profile_name(profile_id)) for profile_id in self.profile_store.profile_ids()]
@@ -301,6 +307,7 @@ class MainWindow(QMainWindow):
         self._configure_trigger_action()
         self._apply_active_profile_camera_settings()
         self._sync_roi_overlays()
+        self._warm_active_profile_ocr()
 
     def _save_active_profile(self, silent: bool = False) -> None:
         self.profile_store.save_profile(self.active_profile_id, self.graph)
@@ -506,6 +513,15 @@ class MainWindow(QMainWindow):
         if params is not None:
             self._apply_camera_settings(params)
 
+    def _warm_active_profile_ocr(self) -> None:
+        ocr_params = [
+            dict(node.params)
+            for node in self.graph.nodes.values()
+            if node.enabled and node.type_name == "ocr" and str(node.params.get("run_mode", "worker")) != "in_process"
+        ]
+        for params in ocr_params:
+            threading.Thread(target=warm_paddle_worker, args=(params,), daemon=True).start()
+
     def _selection_changed(self) -> None:
         if self._closing:
             return
@@ -543,12 +559,28 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(f"{node.title}: {key} updated")
 
+    def _inspector_node_enabled_changed(self, node_id: str, enabled: bool) -> None:
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            self.workbench.inspector.inspect(None)
+            return
+        self.graph.set_node_enabled(node_id, enabled)
+        self.workbench.overlay.graph_scene.update_results()
+        item = self.workbench.overlay.graph_scene.node_items.get(node_id)
+        if item is not None:
+            item.update()
+        self._configure_trigger_action()
+        self._sync_roi_overlays()
+        self.workbench.inspector.inspect(node_id)
+        state = "enabled" if enabled else "disabled"
+        self.statusBar().showMessage(f"{node.title}: {state}")
+
     def _configure_trigger_action(self) -> None:
         node = self.graph.nodes.get("trigger")
         params = node.params if node is not None else {}
         source = str(params.get("source", "keyboard"))
         shortcut = str(params.get("shortcut", "Ctrl+Return"))
-        armed = bool(params.get("armed", True))
+        armed = bool(params.get("armed", True)) and bool(node.enabled if node is not None else True)
         if source == "keyboard" and armed:
             self._run_action.setShortcut(QKeySequence(shortcut))
             self.workbench.set_run_shortcut(shortcut)
@@ -619,4 +651,5 @@ class MainWindow(QMainWindow):
         self._save_active_profile(silent=True)
         self.camera_adapter.stop()
         self.executor.shutdown()
+        shutdown_paddle_worker()
         super().closeEvent(event)

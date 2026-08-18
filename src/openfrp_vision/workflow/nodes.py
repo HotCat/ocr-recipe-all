@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import atexit
+import json
+import os
 from pathlib import Path
 import re
+import select
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 from typing import Any
 
 import cv2
+import numpy as np
 
 from openfrp_vision.camera.base import FrameSnapshot
 from openfrp_vision.workflow.model import NodeDefinition, NodeResult, PortSpec, PortType, RecipeGraph, RecipeNode
@@ -12,10 +22,163 @@ from openfrp_vision.workflow.model import NodeDefinition, NodeResult, PortSpec, 
 
 _PADDLE_OCR = None
 _PADDLE_OCR_USE_CLS_ARG = True
+_PADDLE_WORKER_PREFIX = "__OPENFRP_OCR_RESULT__"
+_PADDLE_WORKER_CLIENT = None
 
 
 def _as_image(value: Any) -> Any:
     return value.image_bgr if isinstance(value, FrameSnapshot) else value
+
+
+def _preview_bgr(image: Any) -> Any:
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    return image.copy()
+
+
+def _point_sets(points: Any) -> list[Any]:
+    if points is None:
+        return []
+    array = cv2.UMat.get(points) if isinstance(points, cv2.UMat) else points
+    try:
+        point_array = np.asarray(array, dtype=float)
+    except Exception:
+        return []
+    if point_array.size == 0:
+        return []
+    if point_array.ndim == 2 and point_array.shape[1] == 2:
+        return [point_array]
+    if point_array.ndim == 3 and point_array.shape[-1] == 2:
+        return [point_array[index] for index in range(point_array.shape[0])]
+    if point_array.ndim == 4 and point_array.shape[-1] == 2:
+        return [point_array[index, 0] for index in range(point_array.shape[0])]
+    return []
+
+
+def _draw_detected_regions(preview: Any, points: Any, labels: list[str]) -> None:
+    for index, point_set in enumerate(_point_sets(points)):
+        pts = point_set.astype("int32").reshape((-1, 1, 2))
+        cv2.polylines(preview, [pts], True, (0, 220, 255), 2)
+        if pts.size:
+            x = int(pts[:, 0, 0].min())
+            y = int(pts[:, 0, 1].min())
+            label = labels[index] if index < len(labels) else "code"
+            cv2.putText(
+                preview,
+                label[:32],
+                (max(0, x), max(14, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 220, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+
+def _decode_qr_image(detector: Any, image: Any) -> tuple[list[str], Any]:
+    try:
+        ok, decoded_info, points, _straight = detector.detectAndDecodeMulti(image)
+    except cv2.error:
+        ok = False
+        decoded_info = ()
+        points = None
+    if ok:
+        decoded = [str(text) for text in decoded_info if str(text)]
+        if decoded:
+            return decoded, points
+
+    try:
+        text, points, _straight = detector.detectAndDecode(image)
+    except cv2.error:
+        return [], None
+    return ([str(text)] if text else []), points
+
+
+def _ordered_quad(points: Any) -> Any | None:
+    point_sets = _point_sets(points)
+    if not point_sets:
+        return None
+    pts = np.asarray(point_sets[0], dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] != 4:
+        return None
+    sums = pts.sum(axis=1)
+    diffs = np.diff(pts, axis=1).ravel()
+    return np.array(
+        [pts[np.argmin(sums)], pts[np.argmin(diffs)], pts[np.argmax(sums)], pts[np.argmax(diffs)]],
+        dtype=np.float32,
+    )
+
+
+def _scale_points(points: Any, factor: float) -> Any:
+    if points is None or factor == 1.0:
+        return points
+    return np.asarray(points, dtype=np.float32) / factor
+
+
+def _qr_preprocess_variants(image: Any, points: Any, params: dict[str, Any]) -> list[tuple[str, Any, float, Any]]:
+    variants: list[tuple[str, Any, float, Any]] = [("raw", image, 1.0, points)]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    variants.append(("gray", gray, 1.0, points))
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    variants.append(("clahe", clahe, 1.0, points))
+
+    sharp = cv2.filter2D(gray, -1, np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32))
+    variants.append(("sharpen", sharp, 1.0, points))
+
+    for block_size in (21, 31, 45):
+        for constant in (2, 5):
+            adaptive = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                block_size,
+                constant,
+            )
+            variants.append((f"adaptive_gaussian_{block_size}_{constant}", adaptive, 1.0, points))
+            if bool(params.get("try_inverted", True)):
+                variants.append((f"adaptive_gaussian_inv_{block_size}_{constant}", 255 - adaptive, 1.0, points))
+
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    variants.append(("otsu", otsu, 1.0, points))
+    if bool(params.get("try_inverted", True)):
+        variants.append(("otsu_inv", 255 - otsu, 1.0, points))
+
+    max_scale = max(1, int(params.get("max_scale", 4)))
+    for scale in range(2, max_scale + 1):
+        up = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        variants.append((f"upscale_{scale}", up, float(scale), points))
+        adaptive_up = cv2.adaptiveThreshold(
+            up,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            3,
+        )
+        variants.append((f"upscale_{scale}_adaptive", adaptive_up, float(scale), points))
+
+    quad = _ordered_quad(points)
+    if quad is not None:
+        for size in (280, 420, 560):
+            dst = np.array([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]], dtype=np.float32)
+            matrix = cv2.getPerspectiveTransform(quad, dst)
+            warped = cv2.warpPerspective(image, matrix, (size, size), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
+            bordered = cv2.copyMakeBorder(warped, size // 8, size // 8, size // 8, size // 8, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+            variants.append((f"rectified_{size}", bordered, 1.0, points))
+            warped_gray = cv2.cvtColor(bordered, cv2.COLOR_BGR2GRAY)
+            warped_adaptive = cv2.adaptiveThreshold(
+                warped_gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                3,
+            )
+            variants.append((f"rectified_{size}_adaptive", warped_adaptive, 1.0, points))
+
+    return variants
 
 
 def _collect_ocr_texts(data: Any, min_score: float) -> tuple[list[str], list[float]]:
@@ -150,9 +313,8 @@ def _aggregate(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
     return NodeResult(result, summary=f"{result['decision']} {sum(c['passed'] for c in checks)}/{len(checks)}")
 
 
-def _paddle_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+def _paddle_ocr_in_process(image: Any, params: dict[str, Any]) -> NodeResult:
     global _PADDLE_OCR, _PADDLE_OCR_USE_CLS_ARG
-    image = _as_image(inputs["image"])
     if _PADDLE_OCR is None:
         try:
             import paddleocr as paddleocr_module
@@ -175,6 +337,9 @@ def _paddle_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
                     use_angle_cls=bool(params.get("use_angle_cls", True)),
                     lang=str(params.get("lang", "en")),
                     show_log=False,
+                    use_gpu=False,
+                    enable_mkldnn=bool(params.get("enable_mkldnn", False)),
+                    ir_optim=bool(params.get("ir_optim", False)),
                 )
                 _PADDLE_OCR_USE_CLS_ARG = True
         except (TypeError, ValueError):
@@ -194,6 +359,292 @@ def _paddle_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
         text = str(params["debug_text"])
     score_summary = f" {max(scores):.2f}" if scores else ""
     return NodeResult(text, preview=image, summary=(text or "no text")[:32] + score_summary)
+
+
+def _parse_paddle_worker(stdout: str) -> dict[str, Any] | None:
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(_PADDLE_WORKER_PREFIX):
+            return json.loads(line[len(_PADDLE_WORKER_PREFIX) :])
+    return None
+
+
+def _signal_name(returncode: int) -> str:
+    if returncode == -4:
+        return "SIGILL illegal instruction"
+    if returncode < 0:
+        return f"signal {-returncode}"
+    return f"exit {returncode}"
+
+
+class _PaddleWorkerClient:
+    def __init__(self) -> None:
+        self._process: subprocess.Popen[str] | None = None
+        self._lock = threading.Lock()
+        self._request_id = 0
+
+    def run(self, image_path: Path, params: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        with self._lock:
+            process = self._ensure_process()
+            self._request_id += 1
+            request_id = str(self._request_id)
+            payload = json.dumps({"id": request_id, "image_path": str(image_path), "params": params}, ensure_ascii=False)
+            assert process.stdin is not None
+            assert process.stdout is not None
+            try:
+                process.stdin.write(payload + "\n")
+                process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                return self._crash_result(process)
+
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    return self._crash_result(process)
+                ready, _, _ = select.select([process.stdout], [], [], min(0.1, max(0.0, deadline - time.monotonic())))
+                if not ready:
+                    continue
+                line = process.stdout.readline()
+                if not line:
+                    return self._crash_result(process)
+                if not line.startswith(_PADDLE_WORKER_PREFIX):
+                    continue
+                result = json.loads(line[len(_PADDLE_WORKER_PREFIX) :])
+                if str(result.get("id", request_id)) == request_id:
+                    return result
+
+            self.stop()
+            return {"ok": False, "error": "PaddleOCR worker timeout"}
+
+    def stop(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    def _ensure_process(self) -> subprocess.Popen[str]:
+        if self._process is not None and self._process.poll() is None:
+            return self._process
+        self._process = subprocess.Popen(
+            [sys.executable, "-B", "-m", "openfrp_vision.workflow.paddle_worker", "--serve"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env={**os.environ, "OMP_NUM_THREADS": "1"},
+        )
+        return self._process
+
+    def _crash_result(self, process: subprocess.Popen[str]) -> dict[str, Any]:
+        code = process.poll()
+        self._process = None
+        return {"ok": False, "error": f"PaddleOCR worker crashed: {_signal_name(code or -1)}"}
+
+
+def _paddle_ocr_subprocess_once(image: Any, params: dict[str, Any]) -> NodeResult:
+    preview = image.copy()
+    fd, path_text = tempfile.mkstemp(prefix="openfrp_paddle_", suffix=".png")
+    os.close(fd)
+    image_path = Path(path_text)
+    try:
+        if not cv2.imwrite(str(image_path), image):
+            raise RuntimeError(f"failed to write OCR worker input image: {image_path}")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "openfrp_vision.workflow.paddle_worker",
+                str(image_path),
+                json.dumps(params, ensure_ascii=False),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, float(params.get("timeout_s", 60.0))),
+            env={**os.environ, "OMP_NUM_THREADS": str(params.get("threads", 1))},
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return NodeResult("", preview=preview, summary="PaddleOCR timeout")
+    finally:
+        try:
+            image_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    result = _parse_paddle_worker(completed.stdout)
+    if completed.returncode != 0:
+        if result and not result.get("ok", False):
+            return NodeResult("", preview=preview, summary=f"PaddleOCR failed: {str(result.get('error', 'worker error'))[:96]}")
+        stderr_tail = (completed.stderr or completed.stdout).splitlines()[-1:] or [""]
+        detail = stderr_tail[0].strip()
+        reason = _signal_name(completed.returncode)
+        if detail:
+            reason = f"{reason}: {detail[:80]}"
+        return NodeResult("", preview=preview, summary=f"PaddleOCR crashed: {reason}")
+
+    if not result:
+        return NodeResult("", preview=preview, summary="PaddleOCR failed: worker returned no result")
+    if not result.get("ok", False):
+        return NodeResult("", preview=preview, summary=f"PaddleOCR failed: {str(result.get('error', 'worker error'))[:96]}")
+
+    text = str(result.get("text", ""))
+    scores = result.get("scores") or []
+    if not text and params.get("debug_text"):
+        text = str(params["debug_text"])
+    score_summary = f" {max(float(score) for score in scores):.2f}" if scores else ""
+    count = int(result.get("count", 0) or 0)
+    prefix = f"OCR {count}" if count else "OCR"
+    return NodeResult(text, preview=preview, summary=f"{prefix}: {(text or 'no text')[:32]}{score_summary}")
+
+
+def _paddle_worker_client() -> _PaddleWorkerClient:
+    global _PADDLE_WORKER_CLIENT
+    if _PADDLE_WORKER_CLIENT is None:
+        _PADDLE_WORKER_CLIENT = _PaddleWorkerClient()
+    return _PADDLE_WORKER_CLIENT
+
+
+def shutdown_paddle_worker() -> None:
+    global _PADDLE_WORKER_CLIENT
+    if _PADDLE_WORKER_CLIENT is not None:
+        _PADDLE_WORKER_CLIENT.stop()
+        _PADDLE_WORKER_CLIENT = None
+
+
+atexit.register(shutdown_paddle_worker)
+
+
+def warm_paddle_worker(params: dict[str, Any]) -> None:
+    mode = str(params.get("run_mode", "worker"))
+    if mode in {"in_process", "subprocess_once", "one_shot"}:
+        return
+    blank = np.full((32, 128, 3), 255, dtype=np.uint8)
+    _paddle_ocr_worker(blank, {**params, "debug_text": ""})
+
+
+def _paddle_ocr_worker(image: Any, params: dict[str, Any]) -> NodeResult:
+    preview = image.copy()
+    fd, path_text = tempfile.mkstemp(prefix="openfrp_paddle_", suffix=".png")
+    os.close(fd)
+    image_path = Path(path_text)
+    try:
+        if not cv2.imwrite(str(image_path), image):
+            raise RuntimeError(f"failed to write OCR worker input image: {image_path}")
+        result = _paddle_worker_client().run(
+            image_path,
+            params,
+            timeout_s=max(1.0, float(params.get("timeout_s", 60.0))),
+        )
+    finally:
+        try:
+            image_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    if not result.get("ok", False):
+        return NodeResult("", preview=preview, summary=str(result.get("error", "PaddleOCR worker failed"))[:120])
+    text = str(result.get("text", ""))
+    scores = result.get("scores") or []
+    if not text and params.get("debug_text"):
+        text = str(params["debug_text"])
+    score_summary = f" {max(float(score) for score in scores):.2f}" if scores else ""
+    count = int(result.get("count", 0) or 0)
+    prefix = f"OCR {count}" if count else "OCR"
+    return NodeResult(text, preview=preview, summary=f"{prefix}: {(text or 'no text')[:32]}{score_summary}")
+
+
+def _paddle_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+    image = _as_image(inputs["image"])
+    mode = str(params.get("run_mode", "worker"))
+    if mode == "in_process":
+        return _paddle_ocr_in_process(image, params)
+    if mode in {"subprocess_once", "one_shot"}:
+        return _paddle_ocr_subprocess_once(image, params)
+    return _paddle_ocr_worker(image, params)
+
+
+def _qr_code_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+    image = _as_image(inputs["image"])
+    detector = cv2.QRCodeDetector()
+    preview = _preview_bgr(image)
+    join_with = str(params.get("join_with", "\n"))
+    debug_text = str(params.get("debug_text", ""))
+    decoded, points = _decode_qr_image(detector, image)
+    method = "raw"
+    if not decoded and bool(params.get("preprocess", True)):
+        for variant_name, variant, scale, fallback_points in _qr_preprocess_variants(image, points, params):
+            decoded, variant_points = _decode_qr_image(detector, variant)
+            if decoded:
+                if variant_points is not None:
+                    points = _scale_points(variant_points, scale) if scale != 1.0 else variant_points
+                else:
+                    points = fallback_points
+                method = variant_name
+                break
+
+    if not decoded and debug_text:
+        decoded = [debug_text]
+    _draw_detected_regions(preview, points, decoded or ["QR"])
+    text = join_with.join(decoded)
+    count = len(decoded)
+    summary = f"QR {count} {method}: {(text or 'no text')[:32]}" if count else f"QR no text ({method})"
+    return NodeResult(text, preview=preview, summary=summary)
+
+
+def _barcode_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+    image = _as_image(inputs["image"])
+    preview = _preview_bgr(image)
+    join_with = str(params.get("join_with", "\n"))
+    debug_text = str(params.get("debug_text", ""))
+    if not hasattr(cv2, "barcode_BarcodeDetector"):
+        if debug_text:
+            return NodeResult(debug_text, preview=preview, summary=f"debug barcode {debug_text}")
+        raise RuntimeError("OpenCV barcode detector is unavailable. Install opencv-contrib-python.")
+
+    detector = cv2.barcode_BarcodeDetector()
+    decoded: list[str] = []
+    types: list[str] = []
+    points = None
+    try:
+        ok, decoded_info, decoded_types, points = detector.detectAndDecodeWithType(image)
+    except (AttributeError, cv2.error):
+        ok = False
+        decoded_info = ()
+        decoded_types = ()
+    if ok:
+        decoded = [str(text) for text in decoded_info if str(text)]
+        types = [str(code_type) for code_type in decoded_types]
+    else:
+        try:
+            ok, decoded_info, points, _straight = detector.detectAndDecodeMulti(image)
+        except cv2.error:
+            ok = False
+            decoded_info = ()
+        if ok:
+            decoded = [str(text) for text in decoded_info if str(text)]
+        else:
+            text, points, _straight = detector.detectAndDecode(image)
+            if text:
+                decoded = [str(text)]
+
+    if not decoded and debug_text:
+        decoded = [debug_text]
+    labels = [f"{types[index]} {text}".strip() if index < len(types) else text for index, text in enumerate(decoded)]
+    _draw_detected_regions(preview, points, labels or ["barcode"])
+    text = join_with.join(decoded)
+    type_summary = f" ({', '.join(types[:3])})" if types else ""
+    count = len(decoded)
+    summary = f"Barcode {count}{type_summary}: {(text or 'no text')[:32]}" if count else "Barcode no text"
+    return NodeResult(text, preview=preview, summary=summary)
 
 
 def _debug_image(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
@@ -308,8 +759,39 @@ def build_definitions() -> dict[str, NodeDefinition]:
             "Recognition",
             image_in,
             PortSpec("text", PortType.TEXT),
-            {"lang": "en", "use_angle_cls": True, "min_score": 0.0, "join_with": "", "debug_text": ""},
+            {
+                "lang": "en",
+                "run_mode": "worker",
+                "timeout_s": 60,
+                "threads": 1,
+                "use_angle_cls": True,
+                "min_score": 0.0,
+                "join_with": "",
+                "debug_text": "",
+                "enable_mkldnn": False,
+                "ir_optim": False,
+            },
             _paddle_ocr,
+        ),
+        NodeDefinition(
+            "qr_code_ocr",
+            "QR Code OCR",
+            "Recognition",
+            image_in,
+            PortSpec("text", PortType.TEXT),
+            {"join_with": "\n", "debug_text": "", "preprocess": True, "try_inverted": True, "max_scale": 4},
+            _qr_code_ocr,
+            True,
+        ),
+        NodeDefinition(
+            "barcode_ocr",
+            "Barcode OCR",
+            "Recognition",
+            image_in,
+            PortSpec("text", PortType.TEXT),
+            {"join_with": "\n", "debug_text": ""},
+            _barcode_ocr,
+            True,
         ),
         NodeDefinition("regex", "Regex Check", "Decision", (PortSpec("text", PortType.TEXT),), PortSpec("verdict", PortType.VERDICT), {"label": "Field", "pattern": ".+"}, _regex, True),
         NodeDefinition("aggregate", "Aggregate", "Decision", (PortSpec("checks", PortType.VERDICT, multiple=True),), PortSpec("result", PortType.RESULT), {}, _aggregate, True),

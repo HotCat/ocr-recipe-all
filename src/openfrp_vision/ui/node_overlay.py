@@ -151,6 +151,7 @@ class NodeItem(QGraphicsObject):
         self.summary_item.setBrush(QColor("#475569"))
         self.summary_item.setFont(QFont("Arial", 8))
         self.summary_item.setPos(14, self.height() - 23)
+        self.update_result()
 
     def height(self) -> float:
         return max(self.BASE_HEIGHT, 96 + len(self.definition.inputs) * 22)
@@ -167,14 +168,24 @@ class NodeItem(QGraphicsObject):
         del option, widget
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         body = QRectF(0, 0, self.WIDTH, self.height())
-        painter.setBrush(QColor(255, 255, 255, 224))
-        painter.setPen(QPen(QColor("#19a4bd") if self.isSelected() else QColor(255, 255, 255, 150), 2.5 if self.isSelected() else 1.0))
+        painter.setBrush(QColor(255, 255, 255, 224) if self.node.enabled else QColor(148, 163, 184, 176))
+        border = QColor("#19a4bd") if self.isSelected() else QColor(255, 255, 255, 150)
+        if not self.node.enabled and not self.isSelected():
+            border = QColor(100, 116, 139, 170)
+        painter.setPen(QPen(border, 2.5 if self.isSelected() else 1.0))
         painter.drawRoundedRect(body, 6, 6)
 
         header = QPainterPath()
         header.addRoundedRect(QRectF(0, 0, self.WIDTH, 32), 6, 6)
         header.addRect(QRectF(0, 24, self.WIDTH, 8))
-        painter.fillPath(header, CATEGORY_COLORS.get(self.definition.category, QColor("#56616b")))
+        header_color = CATEGORY_COLORS.get(self.definition.category, QColor("#56616b"))
+        if not self.node.enabled:
+            header_color = QColor("#64748b")
+        painter.fillPath(header, header_color)
+
+        if not self.node.enabled:
+            painter.setPen(QPen(QColor(15, 23, 42, 165), 1.0))
+            painter.drawLine(QPointF(14, self.height() - 36), QPointF(self.WIDTH - 14, 44))
 
         result = self.graph.results.get(self.node_id)
         if result is not None:
@@ -186,11 +197,18 @@ class NodeItem(QGraphicsObject):
             painter.drawEllipse(QPointF(self.WIDTH - 14, 16), 5, 5)
 
     def update_result(self) -> None:
+        if not self.node.enabled:
+            self.summary_item.setText("Disabled")
+            self.summary_item.setBrush(QColor("#334155"))
+            self.update()
+            return
         result = self.graph.results.get(self.node_id)
         if result is None:
             self.summary_item.setText("Not run")
+            self.summary_item.setBrush(QColor("#475569"))
         else:
             summary = result.summary.replace("\n", " ")
+            self.summary_item.setBrush(QColor("#475569") if not result.skipped else QColor("#8a5a17"))
             self.summary_item.setText(f"{result.elapsed_ms:.1f} ms  {summary[:28]}")
         self.update()
 
@@ -352,6 +370,28 @@ class GraphScene(QGraphicsScene):
             self.graph.results.clear()
             self.rebuild()
             self.message.emit("Selection deleted")
+
+    def set_selection_enabled(self, enabled: bool) -> None:
+        node_ids = [item.node_id for item in self.selectedItems() if isinstance(item, NodeItem)]
+        if not node_ids:
+            return
+        for node_id in node_ids:
+            self.graph.set_node_enabled(node_id, enabled)
+        self.update_results()
+        for node_id in node_ids:
+            item = self.node_items.get(node_id)
+            if item is not None:
+                item.update()
+        state = "enabled" if enabled else "disabled"
+        self.graph_changed.emit()
+        self.message.emit(f"{len(node_ids)} node(s) {state}")
+
+    def toggle_selection_enabled(self) -> None:
+        node_ids = [item.node_id for item in self.selectedItems() if isinstance(item, NodeItem)]
+        if not node_ids:
+            return
+        should_enable = any(not self.graph.nodes[node_id].enabled for node_id in node_ids)
+        self.set_selection_enabled(should_enable)
 
     def update_roi_node(self, node_id: str, roi: tuple[int, int, int, int]) -> None:
         node = self.graph.nodes.get(node_id)
@@ -518,6 +558,13 @@ class NodeOverlayView(QGraphicsView):
             return
         super().mouseReleaseEvent(event)
 
+    def _node_item_for(self, item: QGraphicsItem | None) -> NodeItem | None:
+        while item is not None:
+            if isinstance(item, NodeItem):
+                return item
+            item = item.parentItem()
+        return None
+
     def contextMenuEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         menu = QMenu(self)
         menu.setStyleSheet(
@@ -552,6 +599,21 @@ class NodeOverlayView(QGraphicsView):
             }
             """
         )
+        clicked_node = self._node_item_for(self.itemAt(event.pos()))
+        if clicked_node is not None and not clicked_node.isSelected():
+            self.graph_scene.clearSelection()
+            clicked_node.setSelected(True)
+
+        selected_nodes = [
+            item.node_id for item in self.graph_scene.selectedItems() if isinstance(item, NodeItem)
+        ]
+        if selected_nodes:
+            if any(not self.graph_scene.graph.nodes[node_id].enabled for node_id in selected_nodes):
+                menu.addAction("Enable Selected Node(s)", lambda _checked=False: self.graph_scene.set_selection_enabled(True))
+            if any(self.graph_scene.graph.nodes[node_id].enabled for node_id in selected_nodes):
+                menu.addAction("Disable Selected Node(s)", lambda _checked=False: self.graph_scene.set_selection_enabled(False))
+            menu.addAction("Toggle Selected Node(s)", self.graph_scene.toggle_selection_enabled)
+            menu.addSeparator()
         add_menu = menu.addMenu("Add Node")
         scene_pos = self.mapToScene(event.pos())
         for type_name, definition in sorted(self.graph_scene.graph.definitions.items(), key=lambda item: (item[1].category, item[1].title)):

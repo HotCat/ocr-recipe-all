@@ -30,6 +30,7 @@ from openfrp_vision.workflow.model import RecipeGraph
 
 class NodeInspector(QWidget):
     parameter_changed = Signal(str, str, object)
+    node_enabled_changed = Signal(str, bool)
     request_roi = Signal(str)
 
     def __init__(self, graph: RecipeGraph, parent: QWidget | None = None) -> None:
@@ -126,6 +127,9 @@ class NodeInspector(QWidget):
         self.node_meta.setWordWrap(True)
         layout.addWidget(self.node_title)
         layout.addWidget(self.node_meta)
+        self.enabled_check = QCheckBox("Enabled")
+        self.enabled_check.toggled.connect(self._enabled_changed)
+        layout.addWidget(self.enabled_check)
 
         rule = QFrame()
         rule.setObjectName("rule")
@@ -175,6 +179,7 @@ class NodeInspector(QWidget):
         if self.current_node_id is None:
             self.node_title.setText("No node selected")
             self.node_meta.setText("Select a node to edit profile-scoped parameters.")
+            self.enabled_check.setVisible(False)
             self.roi_button.setVisible(False)
             self.preview.setPixmap(QPixmap())
             self.preview.setText("No preview")
@@ -184,7 +189,12 @@ class NodeInspector(QWidget):
         node = self.graph.nodes[self.current_node_id]
         definition = self.graph.definitions[node.type_name]
         self.node_title.setText(node.title)
-        self.node_meta.setText(f"{definition.category} / {definition.title} / revision {self.graph.revision}")
+        state = "enabled" if node.enabled else "disabled"
+        self.node_meta.setText(f"{definition.category} / {definition.title} / {state} / revision {self.graph.revision}")
+        blocked = self.enabled_check.blockSignals(True)
+        self.enabled_check.setChecked(node.enabled)
+        self.enabled_check.blockSignals(blocked)
+        self.enabled_check.setVisible(True)
         self.roi_button.setVisible(node.type_name == "roi")
         for key, value in node.params.items():
             if key == "snapshot":
@@ -417,11 +427,17 @@ class NodeInspector(QWidget):
         if self.current_node_id is not None:
             self.request_roi.emit(self.current_node_id)
 
+    def _enabled_changed(self, enabled: bool) -> None:
+        if self.current_node_id is not None:
+            self.node_enabled_changed.emit(self.current_node_id, enabled)
+
     def _combo_options(self, node_type: str, key: str) -> list[str]:
         if node_type == "trigger_switch" and key == "source":
             return ["keyboard", "external", "manual"]
         if node_type == "ocr" and key == "lang":
             return ["en", "ch"]
+        if node_type == "ocr" and key == "run_mode":
+            return ["worker", "subprocess_once", "in_process"]
         return []
 
     def _int_range(self, node_type: str, key: str) -> tuple[int, int, int, str]:
