@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from openfrp_vision.camera.base import FrameSnapshot
+from typing import Any
+
 from openfrp_vision.workflow.model import NodeResult, RecipeGraph
 
 
@@ -27,13 +29,23 @@ class WorkflowExecutor:
     def __init__(self, max_workers: int = 1) -> None:
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="workflow")
 
-    def submit(self, graph: RecipeGraph, snapshot: FrameSnapshot) -> Future[WorkflowRun]:
+    def submit(self, graph: RecipeGraph, snapshot: FrameSnapshot, context: dict[str, Any] | None = None) -> Future[WorkflowRun]:
         run_id = uuid4().hex
+        runtime_context = dict(context or {})
 
         def run() -> WorkflowRun:
             for node in graph.nodes.values():
                 if node.type_name == "frame_source":
                     node.params["snapshot"] = snapshot
+                if node.type_name == "sqlite_log":
+                    node.params.update(
+                        {
+                            "_node_id": node.node_id,
+                            "_run_id": run_id,
+                            "_frame_id": snapshot.frame_id,
+                            **runtime_context,
+                        }
+                    )
             results = graph.execute()
             return WorkflowRun(run_id=run_id, revision=graph.revision, frame_id=snapshot.frame_id, results=results)
 

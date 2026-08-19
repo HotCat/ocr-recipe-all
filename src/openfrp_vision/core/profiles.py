@@ -22,6 +22,9 @@ DEFAULT_INDICATOR_SETTINGS = {
 DEFAULT_STATS_SETTINGS = {
     "geometry": [36, 86, 420, 150],
 }
+DEFAULT_LOG_VIEWER_SETTINGS = {
+    "geometry": [48, 86, 820, 560],
+}
 
 
 def default_config_path() -> Path:
@@ -121,6 +124,15 @@ class ProfileStore:
             return dict(DEFAULT_STATS_SETTINGS)
         return {**DEFAULT_STATS_SETTINGS, **settings}
 
+    def log_viewer_settings(self, profile_id: str) -> dict[str, Any]:
+        profile = self.data.get("profiles", {}).get(profile_id)
+        if not isinstance(profile, dict):
+            return dict(DEFAULT_LOG_VIEWER_SETTINGS)
+        settings = profile.get("log_viewer")
+        if not isinstance(settings, dict):
+            return dict(DEFAULT_LOG_VIEWER_SETTINGS)
+        return {**DEFAULT_LOG_VIEWER_SETTINGS, **settings}
+
     def set_active(self, profile_id: str) -> None:
         if profile_id not in self.data.get("profiles", {}):
             raise KeyError(profile_id)
@@ -134,13 +146,15 @@ class ProfileStore:
         name: str | None = None,
         indicator: dict[str, Any] | None = None,
         stats: dict[str, Any] | None = None,
+        log_viewer: dict[str, Any] | None = None,
     ) -> None:
         profiles = self.data.setdefault("profiles", {})
         current = profiles.get(profile_id, {})
         display_name = name or str(current.get("name") or profile_id)
         indicator_settings = indicator or self.indicator_settings(profile_id)
         stats_settings = stats or self.stats_settings(profile_id)
-        profiles[profile_id] = self._profile_payload(display_name, graph, indicator_settings, stats_settings)
+        log_viewer_settings = log_viewer or self.log_viewer_settings(profile_id)
+        profiles[profile_id] = self._profile_payload(display_name, graph, indicator_settings, stats_settings, log_viewer_settings)
         self.data["active_profile"] = profile_id
         self.save()
 
@@ -150,6 +164,7 @@ class ProfileStore:
         graph: RecipeGraph,
         indicator: dict[str, Any] | None = None,
         stats: dict[str, Any] | None = None,
+        log_viewer: dict[str, Any] | None = None,
     ) -> str:
         profiles = self.data.setdefault("profiles", {})
         profile_id = _profile_id(name, set(profiles.keys()))
@@ -158,6 +173,7 @@ class ProfileStore:
             graph,
             indicator or DEFAULT_INDICATOR_SETTINGS,
             stats or DEFAULT_STATS_SETTINGS,
+            log_viewer or DEFAULT_LOG_VIEWER_SETTINGS,
         )
         self.data["active_profile"] = profile_id
         self.save()
@@ -173,6 +189,7 @@ class ProfileStore:
         graph: RecipeGraph,
         indicator: dict[str, Any] | None = None,
         stats: dict[str, Any] | None = None,
+        log_viewer: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
             "name": name,
@@ -180,4 +197,5 @@ class ProfileStore:
             "graph": graph.to_dict(),
             "indicator": {**DEFAULT_INDICATOR_SETTINGS, **(indicator or {})},
             "stats": {**DEFAULT_STATS_SETTINGS, **(stats or {})},
+            "log_viewer": {**DEFAULT_LOG_VIEWER_SETTINGS, **(log_viewer or {})},
         }

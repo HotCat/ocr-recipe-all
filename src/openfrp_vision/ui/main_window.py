@@ -40,6 +40,7 @@ from openfrp_vision.core.profiles import ProfileStore
 from openfrp_vision.ui.camera_preview import CameraGLView
 from openfrp_vision.ui.inspector import NodeInspector
 from openfrp_vision.ui.node_overlay import NodeOverlayView
+from openfrp_vision.ui.production_log_viewer import ProductionLogViewer
 from openfrp_vision.ui.production_stats import ProductionStatsWidget
 from openfrp_vision.ui.result_indicator import ResultIndicatorWidget
 from openfrp_vision.ui.roi_overlay import RoiHandleWidget
@@ -58,6 +59,8 @@ class CameraWorkbench(QWidget):
         self.inspector = NodeInspector(graph, self)
         self.result_indicator = ResultIndicatorWidget(self)
         self.production_stats = ProductionStatsWidget(self)
+        self.production_log_viewer = ProductionLogViewer(self)
+        self.production_log_viewer.hide()
         self.roi_overlays: dict[str, RoiHandleWidget] = {}
         self._frame_size = (1280, 720)
         self._inspector_enabled = True
@@ -96,6 +99,7 @@ class CameraWorkbench(QWidget):
         self.inspector_button = QPushButton()
         self.indicator_button = QPushButton()
         self.stats_button = QPushButton()
+        self.logs_button = QPushButton()
         self.zoom_out_button = QPushButton("-")
         self.zoom_in_button = QPushButton("+")
         self.zoom_fit_button = QPushButton()
@@ -120,6 +124,7 @@ class CameraWorkbench(QWidget):
         hud_layout.addWidget(self.inspector_button)
         hud_layout.addWidget(self.indicator_button)
         hud_layout.addWidget(self.stats_button)
+        hud_layout.addWidget(self.logs_button)
         hud_layout.addWidget(self.zoom_out_button)
         hud_layout.addWidget(self.zoom_in_button)
         hud_layout.addWidget(self.zoom_fit_button)
@@ -168,6 +173,15 @@ class CameraWorkbench(QWidget):
         self.production_stats.show()
         self._raise_floaters()
 
+    def set_log_viewer_settings(self, settings: dict) -> None:
+        self.production_log_viewer.apply_settings(settings)
+        self._place_log_viewer_away_from_hud()
+        self._raise_floaters()
+
+    def configure_log_viewer(self, profile_id: str, db_path: str = "") -> None:
+        self.production_log_viewer.configure(profile_id, db_path)
+        self._raise_floaters()
+
     def set_stats_counts(self, ok: int, ng: int) -> None:
         self.production_stats.set_counts(ok, ng)
 
@@ -184,6 +198,14 @@ class CameraWorkbench(QWidget):
 
     def toggle_stats(self) -> None:
         self.production_stats.setVisible(not self.production_stats.isVisible())
+        self._raise_floaters()
+
+    def toggle_logs(self) -> None:
+        show_logs = self.production_log_viewer.isHidden()
+        self.production_log_viewer.setVisible(show_logs)
+        if show_logs:
+            self._place_log_viewer_away_from_hud()
+            self.production_log_viewer.refresh()
         self._raise_floaters()
 
     def set_profiles(self, profiles: list[tuple[str, str]], active_profile_id: str) -> None:
@@ -216,6 +238,7 @@ class CameraWorkbench(QWidget):
         self.inspector_button.setText(tr("hud.inspector"))
         self.indicator_button.setText(tr("hud.result"))
         self.stats_button.setText(tr("hud.stats"))
+        self.logs_button.setText(tr("hud.logs"))
         self.zoom_fit_button.setText(tr("hud.fit"))
         self.toggle_button.setText(tr("hud.overlay"))
         self.set_run_shortcut(self._run_shortcut)
@@ -225,6 +248,7 @@ class CameraWorkbench(QWidget):
         self.inspector.retranslate()
         self.result_indicator.retranslate()
         self.production_stats.retranslate()
+        self.production_log_viewer.retranslate()
 
     def _populate_node_combo(self) -> None:
         current_type = self.node_combo.currentData()
@@ -253,6 +277,8 @@ class CameraWorkbench(QWidget):
             self.inspector.clamp_to_parent()
         self.result_indicator.clamp_to_parent()
         self.production_stats.clamp_to_parent()
+        self.production_log_viewer.clamp_to_parent()
+        self._place_log_viewer_away_from_hud()
         for overlay in self.roi_overlays.values():
             overlay.parent_resized()
         self._raise_floaters()
@@ -293,9 +319,13 @@ class CameraWorkbench(QWidget):
         for overlay in self.roi_overlays.values():
             overlay.raise_()
         self.inspector.raise_()
+        self.production_log_viewer.raise_()
         self.production_stats.raise_()
         self.result_indicator.raise_()
         self.hud.raise_()
+
+    def _place_log_viewer_away_from_hud(self) -> None:
+        self.production_log_viewer.avoid_rect(self.hud.geometry().adjusted(-4, -4, 4, 8), 14)
 
 
 class MainWindow(QMainWindow):
@@ -337,6 +367,7 @@ class MainWindow(QMainWindow):
         self.workbench.inspector_button.clicked.connect(lambda: self.workbench.toggle_inspector(self.state.overlay_mode))
         self.workbench.indicator_button.clicked.connect(self.workbench.toggle_indicator)
         self.workbench.stats_button.clicked.connect(self.workbench.toggle_stats)
+        self.workbench.logs_button.clicked.connect(self.workbench.toggle_logs)
         self.workbench.zoom_out_button.clicked.connect(self.workbench.overlay.zoom_out)
         self.workbench.zoom_in_button.clicked.connect(self.workbench.overlay.zoom_in)
         self.workbench.zoom_fit_button.clicked.connect(self.workbench.overlay.fit_to_nodes)
@@ -354,10 +385,13 @@ class MainWindow(QMainWindow):
         self.workbench.roi_overlay_changed.connect(self._roi_overlay_changed)
         self.workbench.result_indicator.settings_changed.connect(self._indicator_settings_changed)
         self.workbench.production_stats.settings_changed.connect(self._stats_settings_changed)
+        self.workbench.production_log_viewer.settings_changed.connect(self._log_viewer_settings_changed)
         self.workflow_done.connect(self._workflow_finished)
         self._populate_profiles()
         self.workbench.set_indicator_settings(self.profile_store.indicator_settings(self.active_profile_id))
         self.workbench.set_stats_settings(self.profile_store.stats_settings(self.active_profile_id))
+        self.workbench.set_log_viewer_settings(self.profile_store.log_viewer_settings(self.active_profile_id))
+        self.workbench.configure_log_viewer(self.active_profile_id, self._active_log_db_path())
         self._sync_stats_counts()
         self._sync_roi_overlays()
         self.statusBar().showMessage(tr("status.loaded_nodes", nodes=len(self.graph.nodes), edges=len(self.graph.edges)))
@@ -394,6 +428,7 @@ class MainWindow(QMainWindow):
     def _graph_changed(self) -> None:
         self._configure_trigger_action()
         self._sync_roi_overlays()
+        self.workbench.configure_log_viewer(self.active_profile_id, self._active_log_db_path())
         current = self.workbench.inspector.current_node_id
         if current in self.graph.nodes:
             self.workbench.inspector.inspect(current)
@@ -432,6 +467,8 @@ class MainWindow(QMainWindow):
         self.workbench.set_graph(graph)
         self.workbench.set_indicator_settings(self.profile_store.indicator_settings(self.active_profile_id))
         self.workbench.set_stats_settings(self.profile_store.stats_settings(self.active_profile_id))
+        self.workbench.set_log_viewer_settings(self.profile_store.log_viewer_settings(self.active_profile_id))
+        self.workbench.configure_log_viewer(self.active_profile_id, self._active_log_db_path())
         self.workbench.inspector.inspect(None)
         self._configure_trigger_action()
         self._apply_active_profile_camera_settings()
@@ -444,6 +481,7 @@ class MainWindow(QMainWindow):
             self.graph,
             indicator=self.workbench.result_indicator.settings(),
             stats=self.workbench.production_stats.settings(),
+            log_viewer=self.workbench.production_log_viewer.settings(),
         )
         if not silent:
             self.statusBar().showMessage(
@@ -468,6 +506,7 @@ class MainWindow(QMainWindow):
             self.graph,
             indicator=self.workbench.result_indicator.settings(),
             stats=self.workbench.production_stats.settings(),
+            log_viewer=self.workbench.production_log_viewer.settings(),
         )
         self._populate_profiles()
         self.statusBar().showMessage(tr("status.created_profile", profile=name))
@@ -701,7 +740,7 @@ class MainWindow(QMainWindow):
                 tr(
                     "status.camera_param_updated",
                     node=node_label(node, self.graph.definitions[node.type_name].title),
-                    key=param_label(key),
+                    param=param_label(key),
                     profile=self.profile_store.profile_name(self.active_profile_id),
                 )
             )
@@ -709,8 +748,10 @@ class MainWindow(QMainWindow):
             self._configure_trigger_action()
             self.statusBar().showMessage(tr("status.trigger_updated", node=node_label(node, self.graph.definitions[node.type_name].title)))
         else:
+            if node.type_name == "sqlite_log":
+                self.workbench.configure_log_viewer(self.active_profile_id, self._active_log_db_path())
             self.statusBar().showMessage(
-                tr("status.param_updated", node=node_label(node, self.graph.definitions[node.type_name].title), key=param_label(key))
+                tr("status.param_updated", node=node_label(node, self.graph.definitions[node.type_name].title), param=param_label(key))
             )
 
     def _inspector_node_enabled_changed(self, node_id: str, enabled: bool) -> None:
@@ -738,6 +779,12 @@ class MainWindow(QMainWindow):
         profile = self.profile_store.data.setdefault("profiles", {}).get(self.active_profile_id)
         if isinstance(profile, dict):
             profile["stats"] = settings
+
+    def _log_viewer_settings_changed(self, settings: dict) -> None:
+        profile = self.profile_store.data.setdefault("profiles", {}).get(self.active_profile_id)
+        if isinstance(profile, dict):
+            profile["log_viewer"] = settings
+            self.profile_store.save()
 
     def _sync_stats_counts(self) -> None:
         counters = self.state.counters
@@ -792,7 +839,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(tr("status.workflow_busy"))
             return
         self.dispatch(WorkflowRequested(self.latest_snapshot, self.graph.revision))
-        future = self.executor.submit(self.graph, self.latest_snapshot)
+        future = self.executor.submit(
+            self.graph,
+            self.latest_snapshot,
+            {
+                "_profile_id": self.active_profile_id,
+                "_profile_name": self.profile_store.profile_name(self.active_profile_id),
+            },
+        )
         future.add_done_callback(lambda done: self.workflow_done.emit(done))
         self.statusBar().showMessage(tr("status.workflow_submitted", frame=self.latest_snapshot.frame_id))
 
@@ -810,8 +864,16 @@ class MainWindow(QMainWindow):
         self.workbench.overlay.graph_scene.update_results()
         self.workbench.inspector.refresh_result()
         self._show_debug_popups(run)
+        if self.workbench.production_log_viewer.isVisible():
+            self.workbench.production_log_viewer.refresh()
         self.workbench.result_indicator.blink(passed)
         self.statusBar().showMessage(tr("status.workflow_done", decision=final_result.get("decision", "DONE"), frame=run.frame_id))
+
+    def _active_log_db_path(self) -> str:
+        for node in self.graph.nodes.values():
+            if node.enabled and node.type_name == "sqlite_log":
+                return str(node.params.get("db_path", ""))
+        return ""
 
     def _aggregate_result(self, run: WorkflowRun) -> dict:
         for node_id, result in reversed(run.results.items()):

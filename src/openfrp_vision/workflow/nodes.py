@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from openfrp_vision.camera.base import FrameSnapshot
+from openfrp_vision.core.production_log import insert_result, resolve_log_db_path
 from openfrp_vision.workflow.model import NodeDefinition, NodeResult, PortSpec, PortType, RecipeGraph, RecipeNode
 
 
@@ -314,6 +315,40 @@ def _aggregate(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
     passed = all(check["passed"] for check in checks)
     result = {"passed": passed, "decision": "PASS" if passed else "FAIL", "checks": checks}
     return NodeResult(result, summary=f"{result['decision']} {sum(c['passed'] for c in checks)}/{len(checks)}")
+
+
+def _text_consistency(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+    del params
+    checks = [check for check in list(inputs["checks"]) if isinstance(check, dict)]
+    texts = [str(check.get("text", "")).strip() for check in checks]
+    labels = [str(check.get("label", f"Check {index + 1}")) for index, check in enumerate(checks)]
+    regex_passed = all(bool(check.get("passed", False)) for check in checks)
+    enough_inputs = len(texts) >= 2
+    non_empty = all(bool(text) for text in texts)
+    same_text = enough_inputs and non_empty and len(set(texts)) == 1
+    passed = regex_passed and same_text
+    reference = texts[0] if texts else ""
+    verdict = {
+        "label": "Text Consistency",
+        "passed": passed,
+        "text": reference,
+        "texts": texts,
+        "labels": labels,
+        "checks": checks,
+        "reason": "match" if passed else "mismatch",
+    }
+    if not enough_inputs:
+        verdict["reason"] = "need at least 2 checks"
+    elif not regex_passed:
+        verdict["reason"] = "regex failed"
+    elif not non_empty:
+        verdict["reason"] = "empty text"
+    elif not same_text:
+        verdict["reason"] = "text mismatch"
+    summary = f"{'PASS' if passed else 'FAIL'} consistency {len(set(texts)) if texts else 0}/{len(texts)}"
+    if reference:
+        summary = f"{summary}: {reference[:32]}"
+    return NodeResult(verdict, summary=summary)
 
 
 def _paddle_ocr_in_process(image: Any, params: dict[str, Any]) -> NodeResult:
@@ -1043,6 +1078,20 @@ def _debug_image(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
     return NodeResult(image, preview=image, summary=", ".join(summary_parts) or "debug pass")
 
 
+def _sqlite_log(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+    result = dict(inputs["result"])
+    if not bool(params.get("write_enabled", True)):
+        return NodeResult(result, summary="SQLite log disabled")
+    path = resolve_log_db_path(str(params.get("db_path", "")).strip())
+    try:
+        row_id = insert_result(path, result, params)
+    except Exception as exc:
+        result["_log_error"] = str(exc)
+        return NodeResult(result, summary=f"SQLite log failed: {exc}")
+    decision = str(result.get("decision") or ("PASS" if bool(result.get("passed", False)) else "FAIL"))
+    return NodeResult(result, summary=f"SQLite logged #{row_id} {decision}")
+
+
 def build_definitions() -> dict[str, NodeDefinition]:
     image_in = (PortSpec("image", PortType.IMAGE),)
     definitions = [
@@ -1133,6 +1182,16 @@ def build_definitions() -> dict[str, NodeDefinition]:
             _debug_image,
         ),
         NodeDefinition(
+            "sqlite_log",
+            "SQLite Log",
+            "Output",
+            (PortSpec("result", PortType.RESULT),),
+            PortSpec("result", PortType.RESULT),
+            {"db_path": "", "write_enabled": True},
+            _sqlite_log,
+            True,
+        ),
+        NodeDefinition(
             "ocr",
             "PaddleOCR",
             "Recognition",
@@ -1185,6 +1244,16 @@ def build_definitions() -> dict[str, NodeDefinition]:
             True,
         ),
         NodeDefinition("regex", "Regex Check", "Decision", (PortSpec("text", PortType.TEXT),), PortSpec("verdict", PortType.VERDICT), {"label": "Field", "pattern": ".+"}, _regex, True),
+        NodeDefinition(
+            "text_consistency",
+            "Text Consistency",
+            "Decision",
+            (PortSpec("checks", PortType.VERDICT, multiple=True),),
+            PortSpec("verdict", PortType.VERDICT),
+            {},
+            _text_consistency,
+            True,
+        ),
         NodeDefinition("aggregate", "Aggregate", "Decision", (PortSpec("checks", PortType.VERDICT, multiple=True),), PortSpec("result", PortType.RESULT), {}, _aggregate, True),
     ]
     return {definition.type_name: definition for definition in definitions}
@@ -1205,6 +1274,7 @@ def build_default_graph(definitions: dict[str, NodeDefinition]) -> RecipeGraph:
         RecipeNode("ocr", "ocr", "PaddleOCR", 1190, 220, {"debug_text": "A7B9C312"}),
         RecipeNode("regex", "regex", "Serial Check", 1420, 220, {"label": "Serial", "pattern": "[A-Z0-9]{8}"}),
         RecipeNode("aggregate", "aggregate", "Decision", 1650, 220),
+        RecipeNode("sqlite_log", "sqlite_log", "SQLite Log", 1880, 220),
     ]
     for node in nodes:
         graph.add_node(node)
@@ -1219,6 +1289,7 @@ def build_default_graph(definitions: dict[str, NodeDefinition]) -> RecipeGraph:
         ("debug_image", "ocr", "image"),
         ("ocr", "regex", "text"),
         ("regex", "aggregate", "checks"),
+        ("aggregate", "sqlite_log", "result"),
     ]:
         graph.connect(source, target, port)
     graph.revision = 0

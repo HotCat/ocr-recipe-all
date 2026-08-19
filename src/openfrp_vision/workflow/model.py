@@ -231,7 +231,11 @@ class RecipeGraph:
                     "title": node.title,
                     "position": [node.x, node.y],
                     "enabled": node.enabled,
-                    "params": {key: copy.deepcopy(value) for key, value in node.params.items() if key != "snapshot"},
+                    "params": {
+                        key: copy.deepcopy(value)
+                        for key, value in node.params.items()
+                        if key != "snapshot" and not key.startswith("_")
+                    },
                 }
                 for node in self.nodes.values()
             ],
