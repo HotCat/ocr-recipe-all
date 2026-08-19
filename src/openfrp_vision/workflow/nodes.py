@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
+import ctypes.util
 import json
 import os
 from pathlib import Path
@@ -24,6 +26,7 @@ _PADDLE_OCR = None
 _PADDLE_OCR_USE_CLS_ARG = True
 _PADDLE_WORKER_PREFIX = "__OPENFRP_OCR_RESULT__"
 _PADDLE_WORKER_CLIENT = None
+_ZBAR_LIB = None
 
 
 def _as_image(value: Any) -> Any:
@@ -115,7 +118,7 @@ def _scale_points(points: Any, factor: float) -> Any:
     return np.asarray(points, dtype=np.float32) / factor
 
 
-def _qr_preprocess_variants(image: Any, points: Any, params: dict[str, Any]) -> list[tuple[str, Any, float, Any]]:
+def _qr_preprocess_variants(image: Any, points: Any | None, params: dict[str, Any]) -> list[tuple[str, Any, float, Any]]:
     variants: list[tuple[str, Any, float, Any]] = [("raw", image, 1.0, points)]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     variants.append(("gray", gray, 1.0, points))
@@ -647,17 +650,132 @@ def _qr_code_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
     return NodeResult(text, preview=preview, summary=summary)
 
 
-def _barcode_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
-    image = _as_image(inputs["image"])
-    preview = _preview_bgr(image)
-    join_with = str(params.get("join_with", "\n"))
-    debug_text = str(params.get("debug_text", ""))
-    if not hasattr(cv2, "barcode_BarcodeDetector"):
-        if debug_text:
-            return NodeResult(debug_text, preview=preview, summary=f"debug barcode {debug_text}")
-        raise RuntimeError("OpenCV barcode detector is unavailable. Install opencv-contrib-python.")
+def _zbar_library() -> Any | None:
+    global _ZBAR_LIB
+    if _ZBAR_LIB is not None:
+        return _ZBAR_LIB
 
-    detector = cv2.barcode_BarcodeDetector()
+    library_path = ctypes.util.find_library("zbar") or "libzbar.so"
+    try:
+        lib = ctypes.CDLL(library_path)
+    except OSError:
+        return None
+
+    lib.zbar_image_scanner_create.restype = ctypes.c_void_p
+    lib.zbar_image_scanner_destroy.argtypes = [ctypes.c_void_p]
+    lib.zbar_image_create.restype = ctypes.c_void_p
+    lib.zbar_image_destroy.argtypes = [ctypes.c_void_p]
+    lib.zbar_image_set_format.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    lib.zbar_image_set_size.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+    lib.zbar_image_set_data.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
+    lib.zbar_scan_image.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.zbar_scan_image.restype = ctypes.c_int
+    lib.zbar_image_first_symbol.argtypes = [ctypes.c_void_p]
+    lib.zbar_image_first_symbol.restype = ctypes.c_void_p
+    lib.zbar_symbol_next.argtypes = [ctypes.c_void_p]
+    lib.zbar_symbol_next.restype = ctypes.c_void_p
+    lib.zbar_symbol_get_data.argtypes = [ctypes.c_void_p]
+    lib.zbar_symbol_get_data.restype = ctypes.c_void_p
+    lib.zbar_symbol_get_data_length.argtypes = [ctypes.c_void_p]
+    lib.zbar_symbol_get_data_length.restype = ctypes.c_uint
+    lib.zbar_symbol_get_type.argtypes = [ctypes.c_void_p]
+    lib.zbar_symbol_get_type.restype = ctypes.c_int
+    lib.zbar_get_symbol_name.argtypes = [ctypes.c_int]
+    lib.zbar_get_symbol_name.restype = ctypes.c_char_p
+    lib.zbar_symbol_get_loc_size.argtypes = [ctypes.c_void_p]
+    lib.zbar_symbol_get_loc_size.restype = ctypes.c_uint
+    lib.zbar_symbol_get_loc_x.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    lib.zbar_symbol_get_loc_x.restype = ctypes.c_int
+    lib.zbar_symbol_get_loc_y.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    lib.zbar_symbol_get_loc_y.restype = ctypes.c_int
+
+    _ZBAR_LIB = lib
+    return lib
+
+
+def _zbar_points_to_box(points: list[tuple[int, int]]) -> Any | None:
+    if not points:
+        return None
+    array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    x0 = float(array[:, 0].min())
+    y0 = float(array[:, 1].min())
+    x1 = float(array[:, 0].max())
+    y1 = float(array[:, 1].max())
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return np.array([[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]], dtype=np.float32)
+
+
+def _decode_barcode_zbar(image: Any) -> tuple[list[str], list[str], Any]:
+    lib = _zbar_library()
+    if lib is None:
+        return [], [], None
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    gray = np.ascontiguousarray(gray)
+    height, width = gray.shape[:2]
+    scanner = lib.zbar_image_scanner_create()
+    zbar_image = lib.zbar_image_create()
+    if not scanner or not zbar_image:
+        if zbar_image:
+            lib.zbar_image_destroy(zbar_image)
+        if scanner:
+            lib.zbar_image_scanner_destroy(scanner)
+        return [], [], None
+
+    decoded: list[str] = []
+    types: list[str] = []
+    all_boxes: list[Any] = []
+    try:
+        lib.zbar_image_set_format(zbar_image, int.from_bytes(b"Y800", "little"))
+        lib.zbar_image_set_size(zbar_image, width, height)
+        lib.zbar_image_set_data(zbar_image, gray.ctypes.data_as(ctypes.c_void_p), gray.nbytes, None)
+        if lib.zbar_scan_image(scanner, zbar_image) <= 0:
+            return [], [], None
+
+        symbol = lib.zbar_image_first_symbol(zbar_image)
+        while symbol:
+            data_length = int(lib.zbar_symbol_get_data_length(symbol))
+            data_pointer = lib.zbar_symbol_get_data(symbol)
+            if data_pointer and data_length:
+                text = ctypes.string_at(data_pointer, data_length).decode("utf-8", "replace")
+                symbol_type = int(lib.zbar_symbol_get_type(symbol))
+                type_name = (lib.zbar_get_symbol_name(symbol_type) or b"").decode("ascii", "replace").replace("-", "_")
+                if text:
+                    decoded.append(text)
+                    types.append(type_name)
+
+                    location_count = int(lib.zbar_symbol_get_loc_size(symbol))
+                    locations = [
+                        (int(lib.zbar_symbol_get_loc_x(symbol, index)), int(lib.zbar_symbol_get_loc_y(symbol, index)))
+                        for index in range(location_count)
+                    ]
+                    box = _zbar_points_to_box(locations)
+                    if box is not None:
+                        all_boxes.append(box[0])
+            symbol = lib.zbar_symbol_next(symbol)
+    finally:
+        lib.zbar_image_destroy(zbar_image)
+        lib.zbar_image_scanner_destroy(scanner)
+
+    points = np.asarray([box for box in all_boxes], dtype=np.float32) if all_boxes else None
+    return decoded, types, points
+
+
+def _decode_barcode_zbar_scaled(image: Any, max_side: int) -> tuple[list[str], list[str], Any, str]:
+    height, width = image.shape[:2]
+    scale = min(1.0, float(max_side) / float(max(width, height))) if max_side > 0 else 1.0
+    if scale < 1.0:
+        resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        decoded, types, points = _decode_barcode_zbar(resized)
+        if decoded:
+            return decoded, types, _scale_points(points, scale), f"zbar/scale{scale:.2f}"
+
+    decoded, types, points = _decode_barcode_zbar(image)
+    return decoded, types, points, "zbar/raw"
+
+
+def _decode_barcode_opencv(detector: Any, image: Any) -> tuple[list[str], list[str], Any]:
     decoded: list[str] = []
     types: list[str] = []
     points = None
@@ -668,8 +786,14 @@ def _barcode_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
         decoded_info = ()
         decoded_types = ()
     if ok:
-        decoded = [str(text) for text in decoded_info if str(text)]
-        types = [str(code_type) for code_type in decoded_types]
+        for index, text in enumerate(decoded_info):
+            text = str(text)
+            if not text:
+                continue
+            decoded.append(text)
+            types.append(str(decoded_types[index]) if index < len(decoded_types) else "")
+        if decoded:
+            return decoded, types, points
     else:
         try:
             ok, decoded_info, points, _straight = detector.detectAndDecodeMulti(image)
@@ -678,10 +802,218 @@ def _barcode_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
             decoded_info = ()
         if ok:
             decoded = [str(text) for text in decoded_info if str(text)]
-        else:
-            text, points, _straight = detector.detectAndDecode(image)
-            if text:
-                decoded = [str(text)]
+            if decoded:
+                return decoded, types, points
+
+    try:
+        text, points, _straight = detector.detectAndDecode(image)
+    except cv2.error:
+        return [], [], None
+    if text:
+        return [str(text)], [], points
+    return [], [], None
+
+
+def _barcode_band_box(gray: Any) -> tuple[int, int, int, int] | None:
+    height, width = gray.shape[:2]
+    if height < 40 or width < 80:
+        return None
+
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    gradient = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+    row_score = np.mean(np.abs(gradient), axis=1)
+    window = max(9, (height // 24) | 1)
+    smoothed = cv2.blur(row_score.reshape(-1, 1), (1, window)).ravel()
+    threshold = max(float(np.percentile(smoothed, 60)), float(smoothed.mean() * 1.15))
+    mask = smoothed >= threshold
+
+    best: tuple[float, int, int] | None = None
+    start: int | None = None
+    for index, active in enumerate([*mask.tolist(), False]):
+        if active and start is None:
+            start = index
+        elif not active and start is not None:
+            end = index
+            run_height = end - start
+            if run_height >= max(12, height // 10):
+                score = float(smoothed[start:end].mean()) * (run_height**0.5)
+                if best is None or score > best[0]:
+                    best = (score, start, end)
+            start = None
+
+    if best is None:
+        return None
+
+    _score, y0, y1 = best
+    vertical_pad = max(8, int((y1 - y0) * 0.15))
+    left_margin = max(2, int(width * 0.06))
+    right_margin = max(2, int(width * 0.03))
+    return (
+        left_margin,
+        max(0, y0 - vertical_pad),
+        max(left_margin + 1, width - right_margin),
+        min(height, y1 + vertical_pad),
+    )
+
+
+def _barcode_variant_boxes(gray: Any) -> list[tuple[str, tuple[int, int, int, int]]]:
+    height, width = gray.shape[:2]
+    left_margin = max(2, int(width * 0.06))
+    right_margin = max(2, int(width * 0.03))
+    boxes: list[tuple[str, tuple[int, int, int, int]]] = []
+    boxes.extend(
+        [
+            ("center_tight", (left_margin, int(height * 0.30), width - right_margin, int(height * 0.79))),
+            ("center_wide", (left_margin, int(height * 0.24), width - right_margin, int(height * 0.84))),
+        ]
+    )
+    band = _barcode_band_box(gray)
+    if band is not None:
+        boxes.append(("band", band))
+
+    unique: list[tuple[str, tuple[int, int, int, int]]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for name, box in boxes:
+        x0, y0, x1, y1 = box
+        x0 = max(0, min(width - 1, x0))
+        y0 = max(0, min(height - 1, y0))
+        x1 = max(x0 + 1, min(width, x1))
+        y1 = max(y0 + 1, min(height, y1))
+        normalized = (x0, y0, x1, y1)
+        if normalized not in seen and (x1 - x0) >= 40 and (y1 - y0) >= 24:
+            seen.add(normalized)
+            unique.append((name, normalized))
+    return unique
+
+
+def _barcode_preprocess_variants(image: Any, params: dict[str, Any]) -> list[tuple[str, Any, float, tuple[int, int]]]:
+    variants: list[tuple[str, Any, float, tuple[int, int]]] = [("raw", image, 1.0, (0, 0))]
+    if not bool(params.get("preprocess", True)):
+        return variants
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    variants.append(("gray", gray, 1.0, (0, 0)))
+
+    if bool(params.get("auto_crop", True)):
+        max_scale = max(1, int(params.get("max_scale", 2)))
+        for box_name, (x0, y0, x1, y1) in _barcode_variant_boxes(gray):
+            crop = gray[y0:y1, x0:x1]
+            variants.append((f"{box_name}_gray", crop, 1.0, (x0, y0)))
+            for scale in range(2, max_scale + 1):
+                upscaled = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                variants.append((f"{box_name}_gray_up{scale}", upscaled, float(scale), (x0, y0)))
+
+    return variants
+
+
+def _map_variant_points(points: Any, scale: float, offset: tuple[int, int]) -> Any:
+    if points is None:
+        return None
+    mapped = np.asarray(points, dtype=np.float32) / scale
+    mapped[..., 0] += float(offset[0])
+    mapped[..., 1] += float(offset[1])
+    return mapped
+
+
+def _barcode_result_score(decoded: list[str], types: list[str]) -> int:
+    score = 0
+    for index, text in enumerate(decoded):
+        code_type = types[index] if index < len(types) else ""
+        item_score = len(text) * 10
+        if text.isdigit() and len(text) == 13:
+            item_score += 80
+        elif text.isdigit() and len(text) == 12:
+            item_score += 55
+        elif text.isdigit() and len(text) == 8:
+            item_score += 20
+        if code_type == "EAN_13":
+            item_score += 100
+        elif code_type == "UPC_A":
+            item_score += 70
+        elif code_type:
+            item_score += 30
+        score = max(score, item_score)
+    return score + len(decoded)
+
+
+def _barcode_result_is_strong(decoded: list[str], types: list[str]) -> bool:
+    for index, text in enumerate(decoded):
+        code_type = types[index] if index < len(types) else ""
+        if code_type == "EAN_13" and text.isdigit() and len(text) == 13:
+            return True
+    return False
+
+
+def _barcode_type_matches(actual: str, expected: str) -> bool:
+    if not expected:
+        return True
+    normalize = lambda text: text.strip().upper().replace("-", "_").replace(" ", "_")
+    return normalize(actual) == normalize(expected)
+
+
+def _filter_barcode_results(decoded: list[str], types: list[str], params: dict[str, Any]) -> tuple[list[str], list[str]]:
+    expected_type = str(params.get("expected_type", "")).strip()
+    expected_pattern = str(params.get("expected_pattern", "")).strip()
+    if not expected_type and not expected_pattern:
+        return decoded, types
+
+    filtered_decoded: list[str] = []
+    filtered_types: list[str] = []
+    for index, text in enumerate(decoded):
+        code_type = types[index] if index < len(types) else ""
+        if expected_type and not _barcode_type_matches(code_type, expected_type):
+            continue
+        if expected_pattern and re.fullmatch(expected_pattern, text) is None:
+            continue
+        filtered_decoded.append(text)
+        filtered_types.append(code_type)
+    return filtered_decoded, filtered_types
+
+
+def _barcode_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+    image = _as_image(inputs["image"])
+    preview = _preview_bgr(image)
+    join_with = str(params.get("join_with", "\n"))
+    debug_text = str(params.get("debug_text", ""))
+    backend = str(params.get("backend", "zbar"))
+    if backend not in {"zbar", "zbar_then_opencv", "opencv"}:
+        backend = "zbar"
+
+    decoded: list[str] = []
+    types: list[str] = []
+    points = None
+    method = backend
+    best_score = -1
+
+    if backend in {"zbar", "zbar_then_opencv"}:
+        candidate_decoded, candidate_types, candidate_points, method = _decode_barcode_zbar_scaled(image, int(params.get("scan_max_side", 640)))
+        decoded, types = _filter_barcode_results(candidate_decoded, candidate_types, params)
+        points = candidate_points if decoded else None
+
+    if not decoded and backend in {"zbar_then_opencv", "opencv"}:
+        if not hasattr(cv2, "barcode_BarcodeDetector"):
+            if debug_text:
+                return NodeResult(debug_text, preview=preview, summary=f"debug barcode {debug_text}")
+            raise RuntimeError("OpenCV barcode detector is unavailable. Install opencv-contrib-python.")
+
+        detector = cv2.barcode_BarcodeDetector()
+        for variant_name, variant, scale, offset in _barcode_preprocess_variants(image, params):
+            candidate_decoded, candidate_types, variant_points = _decode_barcode_opencv(detector, variant)
+            candidate_decoded, candidate_types = _filter_barcode_results(candidate_decoded, candidate_types, params)
+            if candidate_decoded:
+                candidate_score = _barcode_result_score(candidate_decoded, candidate_types)
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    decoded = candidate_decoded
+                    types = candidate_types
+                    points = _map_variant_points(variant_points, scale, offset)
+                    method = f"opencv/{variant_name}"
+                if _barcode_result_is_strong(candidate_decoded, candidate_types):
+                    decoded = candidate_decoded
+                    types = candidate_types
+                    points = _map_variant_points(variant_points, scale, offset)
+                    method = f"opencv/{variant_name}"
+                    break
 
     if not decoded and debug_text:
         decoded = [debug_text]
@@ -690,7 +1022,7 @@ def _barcode_ocr(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
     text = join_with.join(decoded)
     type_summary = f" ({', '.join(types[:3])})" if types else ""
     count = len(decoded)
-    summary = f"Barcode {count}{type_summary}: {(text or 'no text')[:32]}" if count else "Barcode no text"
+    summary = f"Barcode {count}{type_summary} {method}: {(text or 'no text')[:32]}" if count else f"Barcode no text ({method})"
     return NodeResult(text, preview=preview, summary=summary)
 
 
@@ -838,7 +1170,17 @@ def build_definitions() -> dict[str, NodeDefinition]:
             "Recognition",
             image_in,
             PortSpec("text", PortType.TEXT),
-            {"join_with": "\n", "debug_text": ""},
+            {
+                "backend": "zbar",
+                "join_with": "\n",
+                "debug_text": "",
+                "preprocess": True,
+                "auto_crop": True,
+                "scan_max_side": 640,
+                "max_scale": 2,
+                "expected_type": "",
+                "expected_pattern": "",
+            },
             _barcode_ocr,
             True,
         ),

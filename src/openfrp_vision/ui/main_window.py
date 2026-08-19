@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import deque
 import os
 import threading
+import time
 
 import numpy as np
 
@@ -38,6 +40,7 @@ from openfrp_vision.core.profiles import ProfileStore
 from openfrp_vision.ui.camera_preview import CameraGLView
 from openfrp_vision.ui.inspector import NodeInspector
 from openfrp_vision.ui.node_overlay import NodeOverlayView
+from openfrp_vision.ui.production_stats import ProductionStatsWidget
 from openfrp_vision.ui.result_indicator import ResultIndicatorWidget
 from openfrp_vision.ui.roi_overlay import RoiHandleWidget
 from openfrp_vision.workflow.executor import WorkflowExecutor, WorkflowRun
@@ -54,6 +57,7 @@ class CameraWorkbench(QWidget):
         self.overlay = NodeOverlayView(graph)
         self.inspector = NodeInspector(graph, self)
         self.result_indicator = ResultIndicatorWidget(self)
+        self.production_stats = ProductionStatsWidget(self)
         self.roi_overlays: dict[str, RoiHandleWidget] = {}
         self._frame_size = (1280, 720)
         self._inspector_enabled = True
@@ -91,6 +95,7 @@ class CameraWorkbench(QWidget):
         self.camera_button = QPushButton()
         self.inspector_button = QPushButton()
         self.indicator_button = QPushButton()
+        self.stats_button = QPushButton()
         self.zoom_out_button = QPushButton("-")
         self.zoom_in_button = QPushButton("+")
         self.zoom_fit_button = QPushButton()
@@ -114,6 +119,7 @@ class CameraWorkbench(QWidget):
         hud_layout.addWidget(self.camera_button)
         hud_layout.addWidget(self.inspector_button)
         hud_layout.addWidget(self.indicator_button)
+        hud_layout.addWidget(self.stats_button)
         hud_layout.addWidget(self.zoom_out_button)
         hud_layout.addWidget(self.zoom_in_button)
         hud_layout.addWidget(self.zoom_fit_button)
@@ -157,12 +163,27 @@ class CameraWorkbench(QWidget):
         self.result_indicator.show()
         self._raise_floaters()
 
+    def set_stats_settings(self, settings: dict) -> None:
+        self.production_stats.apply_settings(settings)
+        self.production_stats.show()
+        self._raise_floaters()
+
+    def set_stats_counts(self, ok: int, ng: int) -> None:
+        self.production_stats.set_counts(ok, ng)
+
+    def set_stats_fps(self, fps: float) -> None:
+        self.production_stats.set_fps(fps)
+
     def toggle_inspector(self, mode: OverlayMode) -> None:
         self._inspector_enabled = not self._inspector_enabled
         self.apply_overlay_mode(mode)
 
     def toggle_indicator(self) -> None:
         self.result_indicator.setVisible(not self.result_indicator.isVisible())
+        self._raise_floaters()
+
+    def toggle_stats(self) -> None:
+        self.production_stats.setVisible(not self.production_stats.isVisible())
         self._raise_floaters()
 
     def set_profiles(self, profiles: list[tuple[str, str]], active_profile_id: str) -> None:
@@ -194,6 +215,7 @@ class CameraWorkbench(QWidget):
         self.camera_button.setText(tr("hud.camera"))
         self.inspector_button.setText(tr("hud.inspector"))
         self.indicator_button.setText(tr("hud.result"))
+        self.stats_button.setText(tr("hud.stats"))
         self.zoom_fit_button.setText(tr("hud.fit"))
         self.toggle_button.setText(tr("hud.overlay"))
         self.set_run_shortcut(self._run_shortcut)
@@ -202,6 +224,7 @@ class CameraWorkbench(QWidget):
         self.overlay.retranslate()
         self.inspector.retranslate()
         self.result_indicator.retranslate()
+        self.production_stats.retranslate()
 
     def _populate_node_combo(self) -> None:
         current_type = self.node_combo.currentData()
@@ -229,14 +252,14 @@ class CameraWorkbench(QWidget):
         else:
             self.inspector.clamp_to_parent()
         self.result_indicator.clamp_to_parent()
+        self.production_stats.clamp_to_parent()
         for overlay in self.roi_overlays.values():
             overlay.parent_resized()
         self._raise_floaters()
 
     def set_frame_size(self, frame_size: tuple[int, int]) -> None:
         self._frame_size = frame_size
-        for overlay in self.roi_overlays.values():
-            overlay.set_roi(overlay.title, overlay.roi, self._frame_size)
+        self.sync_roi_overlays(self.overlay.graph_scene.graph)
 
     def sync_roi_overlays(self, graph: RecipeGraph) -> None:
         enabled_nodes = {
@@ -270,6 +293,7 @@ class CameraWorkbench(QWidget):
         for overlay in self.roi_overlays.values():
             overlay.raise_()
         self.inspector.raise_()
+        self.production_stats.raise_()
         self.result_indicator.raise_()
         self.hud.raise_()
 
@@ -292,6 +316,9 @@ class MainWindow(QMainWindow):
         self.camera_adapter = HikvisionCameraAdapter()
         self._using_real_camera = False
         self._roi_target_node_id: str | None = None
+        self._fps_samples: deque[tuple[int, float]] = deque(maxlen=240)
+        self._fps_ema = 0.0
+        self._fps_last_publish = 0.0
         self._closing = False
         self.workbench = CameraWorkbench(self.graph)
         self.setCentralWidget(self.workbench)
@@ -309,6 +336,7 @@ class MainWindow(QMainWindow):
         self.workbench.camera_button.clicked.connect(self._restart_camera)
         self.workbench.inspector_button.clicked.connect(lambda: self.workbench.toggle_inspector(self.state.overlay_mode))
         self.workbench.indicator_button.clicked.connect(self.workbench.toggle_indicator)
+        self.workbench.stats_button.clicked.connect(self.workbench.toggle_stats)
         self.workbench.zoom_out_button.clicked.connect(self.workbench.overlay.zoom_out)
         self.workbench.zoom_in_button.clicked.connect(self.workbench.overlay.zoom_in)
         self.workbench.zoom_fit_button.clicked.connect(self.workbench.overlay.fit_to_nodes)
@@ -325,9 +353,12 @@ class MainWindow(QMainWindow):
         self.workbench.inspector.request_roi.connect(self._start_roi_selection)
         self.workbench.roi_overlay_changed.connect(self._roi_overlay_changed)
         self.workbench.result_indicator.settings_changed.connect(self._indicator_settings_changed)
+        self.workbench.production_stats.settings_changed.connect(self._stats_settings_changed)
         self.workflow_done.connect(self._workflow_finished)
         self._populate_profiles()
         self.workbench.set_indicator_settings(self.profile_store.indicator_settings(self.active_profile_id))
+        self.workbench.set_stats_settings(self.profile_store.stats_settings(self.active_profile_id))
+        self._sync_stats_counts()
         self._sync_roi_overlays()
         self.statusBar().showMessage(tr("status.loaded_nodes", nodes=len(self.graph.nodes), edges=len(self.graph.edges)))
         self.camera_adapter.frame_ready.connect(self._on_live_camera_frame)
@@ -400,6 +431,7 @@ class MainWindow(QMainWindow):
         self.graph = graph
         self.workbench.set_graph(graph)
         self.workbench.set_indicator_settings(self.profile_store.indicator_settings(self.active_profile_id))
+        self.workbench.set_stats_settings(self.profile_store.stats_settings(self.active_profile_id))
         self.workbench.inspector.inspect(None)
         self._configure_trigger_action()
         self._apply_active_profile_camera_settings()
@@ -407,7 +439,12 @@ class MainWindow(QMainWindow):
         self._warm_active_profile_ocr()
 
     def _save_active_profile(self, silent: bool = False) -> None:
-        self.profile_store.save_profile(self.active_profile_id, self.graph, indicator=self.workbench.result_indicator.settings())
+        self.profile_store.save_profile(
+            self.active_profile_id,
+            self.graph,
+            indicator=self.workbench.result_indicator.settings(),
+            stats=self.workbench.production_stats.settings(),
+        )
         if not silent:
             self.statusBar().showMessage(
                 tr(
@@ -426,7 +463,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(tr("status.profile_empty"))
             return
         self._save_active_profile(silent=True)
-        self.active_profile_id = self.profile_store.create_profile(name, self.graph, indicator=self.workbench.result_indicator.settings())
+        self.active_profile_id = self.profile_store.create_profile(
+            name,
+            self.graph,
+            indicator=self.workbench.result_indicator.settings(),
+            stats=self.workbench.production_stats.settings(),
+        )
         self._populate_profiles()
         self.statusBar().showMessage(tr("status.created_profile", profile=name))
 
@@ -457,6 +499,7 @@ class MainWindow(QMainWindow):
         self.latest_snapshot = snapshot
         self.workbench.camera.set_frame(snapshot)
         self.workbench.set_frame_size(snapshot.size)
+        self._update_fps(snapshot)
 
     def _start_camera_if_available(self) -> None:
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
@@ -495,6 +538,7 @@ class MainWindow(QMainWindow):
         self.latest_snapshot = snapshot
         self.workbench.camera.set_frame(snapshot)
         self.workbench.set_frame_size(snapshot.size)
+        self._update_fps(snapshot)
         if snapshot.frame_id == 1 or snapshot.frame_id % 20 == 0:
             self.workbench.set_camera_status(self.camera_adapter.hud_status)
 
@@ -690,6 +734,38 @@ class MainWindow(QMainWindow):
         if isinstance(profile, dict):
             profile["indicator"] = settings
 
+    def _stats_settings_changed(self, settings: dict) -> None:
+        profile = self.profile_store.data.setdefault("profiles", {}).get(self.active_profile_id)
+        if isinstance(profile, dict):
+            profile["stats"] = settings
+
+    def _sync_stats_counts(self) -> None:
+        counters = self.state.counters
+        self.workbench.set_stats_counts(int(counters.get("ok", 0)), int(counters.get("ng", 0)))
+
+    def _update_fps(self, snapshot: FrameSnapshot) -> None:
+        timestamp = float(snapshot.timestamp_s)
+        if self._fps_samples and timestamp <= self._fps_samples[-1][1]:
+            self._fps_samples.clear()
+            self._fps_ema = 0.0
+        self._fps_samples.append((int(snapshot.frame_id), timestamp))
+        while len(self._fps_samples) > 2 and timestamp - self._fps_samples[0][1] > 2.5:
+            self._fps_samples.popleft()
+
+        now = time.perf_counter()
+        if now - self._fps_last_publish < 0.25 or len(self._fps_samples) < 2:
+            return
+        first_id, first_timestamp = self._fps_samples[0]
+        last_id, last_timestamp = self._fps_samples[-1]
+        span = last_timestamp - first_timestamp
+        if span < 0.35:
+            return
+        frame_count = last_id - first_id if last_id > first_id else len(self._fps_samples) - 1
+        measured = max(0.0, frame_count / max(1e-6, span))
+        self._fps_ema = measured if self._fps_ema <= 0 else self._fps_ema * 0.75 + measured * 0.25
+        self._fps_last_publish = now
+        self.workbench.set_stats_fps(self._fps_ema)
+
     def _configure_trigger_action(self) -> None:
         node = self.graph.nodes.get("trigger")
         params = node.params if node is not None else {}
@@ -730,6 +806,7 @@ class MainWindow(QMainWindow):
         final_result = self._aggregate_result(run)
         passed = bool(final_result.get("passed", False))
         self.dispatch(WorkflowFinished(run.run_id, passed, final_result))
+        self._sync_stats_counts()
         self.workbench.overlay.graph_scene.update_results()
         self.workbench.inspector.refresh_result()
         self._show_debug_popups(run)

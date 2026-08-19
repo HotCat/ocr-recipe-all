@@ -457,6 +457,10 @@ class NodeInspector(QWidget):
             return ["worker", "subprocess_once", "in_process"]
         if node_type == "ocr" and key == "ocr_version":
             return ["PP-OCRv3", "PP-OCRv4"]
+        if node_type == "barcode_ocr" and key == "backend":
+            return ["zbar", "zbar_then_opencv", "opencv"]
+        if node_type == "barcode_ocr" and key == "expected_type":
+            return ["", "EAN_13", "EAN_8", "UPC_A", "CODE_128", "CODE_39"]
         return []
 
     def _int_range(self, node_type: str, key: str) -> tuple[int, int, int, str]:
@@ -470,6 +474,8 @@ class NodeInspector(QWidget):
             return 0, 100_000, 1, " px"
         if "threshold" in key:
             return 0, 1000, 1, ""
+        if key == "scan_max_side":
+            return 0, 4096, 16, " px"
         if "fps" in key:
             return 1, 240, 1, " fps"
         if key.endswith("_ms"):

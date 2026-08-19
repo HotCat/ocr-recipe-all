@@ -27,8 +27,8 @@ class RoiHandleWidget(QWidget):
 
     def set_roi(self, title: str, roi: tuple[int, int, int, int], frame_size: tuple[int, int]) -> None:
         self.title = title
-        self.roi = self._clamp_roi(roi)
         self.frame_size = (max(1, int(frame_size[0])), max(1, int(frame_size[1])))
+        self.roi = self._clamp_roi(roi)
         self._sync_geometry()
         self.update()
 

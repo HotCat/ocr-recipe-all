@@ -19,6 +19,9 @@ DEFAULT_INDICATOR_SETTINGS = {
     "blink_duration_s": 2.0,
     "geometry": [24, 72, 260, 190],
 }
+DEFAULT_STATS_SETTINGS = {
+    "geometry": [36, 86, 420, 150],
+}
 
 
 def default_config_path() -> Path:
@@ -109,25 +112,53 @@ class ProfileStore:
             return dict(DEFAULT_INDICATOR_SETTINGS)
         return {**DEFAULT_INDICATOR_SETTINGS, **settings}
 
+    def stats_settings(self, profile_id: str) -> dict[str, Any]:
+        profile = self.data.get("profiles", {}).get(profile_id)
+        if not isinstance(profile, dict):
+            return dict(DEFAULT_STATS_SETTINGS)
+        settings = profile.get("stats")
+        if not isinstance(settings, dict):
+            return dict(DEFAULT_STATS_SETTINGS)
+        return {**DEFAULT_STATS_SETTINGS, **settings}
+
     def set_active(self, profile_id: str) -> None:
         if profile_id not in self.data.get("profiles", {}):
             raise KeyError(profile_id)
         self.data["active_profile"] = profile_id
         self.save()
 
-    def save_profile(self, profile_id: str, graph: RecipeGraph, name: str | None = None, indicator: dict[str, Any] | None = None) -> None:
+    def save_profile(
+        self,
+        profile_id: str,
+        graph: RecipeGraph,
+        name: str | None = None,
+        indicator: dict[str, Any] | None = None,
+        stats: dict[str, Any] | None = None,
+    ) -> None:
         profiles = self.data.setdefault("profiles", {})
         current = profiles.get(profile_id, {})
         display_name = name or str(current.get("name") or profile_id)
         indicator_settings = indicator or self.indicator_settings(profile_id)
-        profiles[profile_id] = self._profile_payload(display_name, graph, indicator_settings)
+        stats_settings = stats or self.stats_settings(profile_id)
+        profiles[profile_id] = self._profile_payload(display_name, graph, indicator_settings, stats_settings)
         self.data["active_profile"] = profile_id
         self.save()
 
-    def create_profile(self, name: str, graph: RecipeGraph, indicator: dict[str, Any] | None = None) -> str:
+    def create_profile(
+        self,
+        name: str,
+        graph: RecipeGraph,
+        indicator: dict[str, Any] | None = None,
+        stats: dict[str, Any] | None = None,
+    ) -> str:
         profiles = self.data.setdefault("profiles", {})
         profile_id = _profile_id(name, set(profiles.keys()))
-        profiles[profile_id] = self._profile_payload(name.strip() or profile_id, graph, indicator or DEFAULT_INDICATOR_SETTINGS)
+        profiles[profile_id] = self._profile_payload(
+            name.strip() or profile_id,
+            graph,
+            indicator or DEFAULT_INDICATOR_SETTINGS,
+            stats or DEFAULT_STATS_SETTINGS,
+        )
         self.data["active_profile"] = profile_id
         self.save()
         return profile_id
@@ -136,10 +167,17 @@ class ProfileStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
 
-    def _profile_payload(self, name: str, graph: RecipeGraph, indicator: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _profile_payload(
+        self,
+        name: str,
+        graph: RecipeGraph,
+        indicator: dict[str, Any] | None = None,
+        stats: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return {
             "name": name,
             "updated_at": _now_iso(),
             "graph": graph.to_dict(),
             "indicator": {**DEFAULT_INDICATOR_SETTINGS, **(indicator or {})},
+            "stats": {**DEFAULT_STATS_SETTINGS, **(stats or {})},
         }
