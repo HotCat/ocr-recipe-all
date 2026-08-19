@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 from openfrp_vision.camera.base import FrameSnapshot
-from openfrp_vision.core.production_log import insert_result, resolve_log_db_path
+from openfrp_vision.core.production_log import insert_result, resolve_log_db_path, save_serial_state, serial_state
 from openfrp_vision.workflow.model import NodeDefinition, NodeResult, PortSpec, PortType, RecipeGraph, RecipeNode
 
 
@@ -310,10 +310,136 @@ def _regex(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
     return NodeResult(verdict, summary=f"{'PASS' if passed else 'FAIL'} {text}")
 
 
+def _serial_bounds(params: dict[str, Any], text: str) -> tuple[int, int, int]:
+    length = int(params.get("serial_length", len(str(params.get("sample_text", ""))) or len(text)) or len(text))
+    start = int(params.get("segment_start", 0) or 0)
+    end = int(params.get("segment_end", 0) or 0)
+    if end <= start:
+        end = min(len(text), start + 1)
+    start = max(0, min(start, len(text)))
+    end = max(start, min(end, len(text)))
+    return start, end, max(0, length)
+
+
+def _serial_payload(text: str, start: int, end: int, configured_length: int, direction: str) -> dict[str, Any]:
+    effective = text[start:end]
+    value = int(effective) if effective.isdigit() else None
+    return {
+        "text": text,
+        "effective": effective,
+        "value": value,
+        "start": start,
+        "end": end,
+        "length": configured_length,
+        "direction": direction,
+    }
+
+
+def _replace_serial_segment(text: str, start: int, end: int, value: int) -> str:
+    width = max(1, end - start)
+    replacement = f"{max(0, int(value)):0{width}d}"[-width:]
+    return f"{text[:start]}{replacement}{text[end:]}"
+
+
+def _serial_context(params: dict[str, Any]) -> tuple[Path, str, str]:
+    path = resolve_log_db_path(str(params.get("_log_db_path", "")).strip())
+    profile_id = str(params.get("_profile_id", ""))
+    node_id = str(params.get("_node_id", ""))
+    return path, profile_id, node_id
+
+
+def _serial_continuity(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+    text = str(inputs["text"]).strip()
+    ascending = bool(params.get("ascending", True))
+    direction = "ascending" if ascending else "descending"
+    start, end, configured_length = _serial_bounds(params, text)
+    serial = _serial_payload(text, start, end, configured_length, direction)
+    label = str(params.get("label", "Serial Continuity"))
+    sample_target = str(params.get("_serial_sample_node_id", ""))
+    path, profile_id, node_id = _serial_context(params)
+    if sample_target and sample_target == node_id:
+        serial["node_id"] = node_id
+        serial["expected"] = None
+        serial["previous"] = None
+        verdict = {"label": label, "passed": True, "text": text, "serial": serial, "reason": "sample captured"}
+        return NodeResult(verdict, summary=f"SAMPLE serial {text[:32]}")
+
+    reason = "ok"
+    passed = False
+    expected: int | None = None
+    previous: int | None = None
+    current = serial.get("value")
+    if not text:
+        reason = "empty text"
+    elif configured_length and len(text) != configured_length:
+        reason = f"length {len(text)} != {configured_length}"
+    elif current is None:
+        reason = "selected segment is not numeric"
+    else:
+        state = serial_state(path, profile_id, node_id, "continuity") if profile_id and node_id else None
+        if state is None:
+            passed = True
+            reason = "first serial"
+        else:
+            previous = int(state["value"])
+            step = 1 if ascending else -1
+            expected = previous + step
+            passed = int(current) == expected
+            reason = "ok" if passed else f"expected {expected}"
+        serial["node_id"] = node_id
+        if passed and profile_id and node_id:
+            save_serial_state(path, profile_id, node_id, "continuity", text, int(current))
+
+    serial["expected"] = expected
+    serial["previous"] = previous
+    verdict = {"label": label, "passed": passed, "text": text, "serial": serial, "reason": reason}
+    summary = f"{'PASS' if passed else 'FAIL'} serial {serial.get('effective', '')}"
+    if reason != "ok":
+        summary = f"{summary}: {reason}"
+    return NodeResult(verdict, summary=summary)
+
+
+def _serial_generator(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+    del inputs
+    sample = str(params.get("sample_text", "A000001K"))
+    ascending = bool(params.get("ascending", True))
+    direction = "ascending" if ascending else "descending"
+    path, profile_id, node_id = _serial_context(params)
+    state = serial_state(path, profile_id, node_id, "generator") if profile_id and node_id else None
+    hold = bool(params.get("hold", False))
+    use_sample_text = bool(params.get("use_sample_text", False))
+    if state is None or use_sample_text:
+        text = sample
+    elif hold:
+        text = str(state["text"])
+    else:
+        state_text = str(state["text"])
+        state_start, state_end, _state_length = _serial_bounds(params, state_text)
+        state_serial = _serial_payload(state_text, state_start, state_end, len(state_text), direction)
+        state_value = state_serial.get("value")
+        if state_value is None:
+            text = sample
+        else:
+            next_value = int(state_value) + (1 if ascending else -1)
+            text = _replace_serial_segment(state_text, state_start, state_end, next_value)
+    start, end, configured_length = _serial_bounds(params, text)
+    serial = _serial_payload(text, start, end, configured_length, direction)
+    value = serial.get("value")
+    if value is None:
+        return NodeResult(text, summary=f"debug serial invalid: {serial.get('effective', '')}")
+    if profile_id and node_id:
+        save_serial_state(path, profile_id, node_id, "generator", text, int(value))
+    return NodeResult(text, summary=f"debug serial {serial['effective']}")
+
+
 def _aggregate(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
     checks = list(inputs["checks"])
     passed = all(check["passed"] for check in checks)
     result = {"passed": passed, "decision": "PASS" if passed else "FAIL", "checks": checks}
+    serials = [check["serial"] for check in checks if isinstance(check, dict) and isinstance(check.get("serial"), dict)]
+    if serials:
+        result["serial"] = serials[0]
+        result["serials"] = serials
     return NodeResult(result, summary=f"{result['decision']} {sum(c['passed'] for c in checks)}/{len(checks)}")
 
 
@@ -1080,6 +1206,8 @@ def _debug_image(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
 
 def _sqlite_log(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
     result = dict(inputs["result"])
+    if bool(params.get("_suppress_sqlite_log", False)):
+        return NodeResult(result, summary="SQLite log suppressed")
     if not bool(params.get("write_enabled", True)):
         return NodeResult(result, summary="SQLite log disabled")
     path = resolve_log_db_path(str(params.get("db_path", "")).strip())
@@ -1244,6 +1372,41 @@ def build_definitions() -> dict[str, NodeDefinition]:
             True,
         ),
         NodeDefinition("regex", "Regex Check", "Decision", (PortSpec("text", PortType.TEXT),), PortSpec("verdict", PortType.VERDICT), {"label": "Field", "pattern": ".+"}, _regex, True),
+        NodeDefinition(
+            "serial_continuity",
+            "Serial Continuity",
+            "Decision",
+            (PortSpec("text", PortType.TEXT),),
+            PortSpec("verdict", PortType.VERDICT),
+            {
+                "label": "Serial Continuity",
+                "sample_text": "A904329K",
+                "serial_length": 8,
+                "segment_start": 1,
+                "segment_end": 6,
+                "ascending": True,
+            },
+            _serial_continuity,
+            True,
+        ),
+        NodeDefinition(
+            "serial_generator",
+            "Serial Generator",
+            "Input",
+            (),
+            PortSpec("text", PortType.TEXT),
+            {
+                "sample_text": "A000001K",
+                "serial_length": 8,
+                "segment_start": 1,
+                "segment_end": 7,
+                "ascending": True,
+                "hold": False,
+                "use_sample_text": False,
+            },
+            _serial_generator,
+            True,
+        ),
         NodeDefinition(
             "text_consistency",
             "Text Consistency",

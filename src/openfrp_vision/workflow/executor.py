@@ -34,22 +34,34 @@ class WorkflowExecutor:
         runtime_context = dict(context or {})
 
         def run() -> WorkflowRun:
-            for node in graph.nodes.values():
-                if node.type_name == "frame_source":
-                    node.params["snapshot"] = snapshot
-                if node.type_name == "sqlite_log":
-                    node.params.update(
-                        {
-                            "_node_id": node.node_id,
-                            "_run_id": run_id,
-                            "_frame_id": snapshot.frame_id,
-                            **runtime_context,
-                        }
-                    )
-            results = graph.execute()
-            return WorkflowRun(run_id=run_id, revision=graph.revision, frame_id=snapshot.frame_id, results=results)
+            try:
+                for node in graph.nodes.values():
+                    self._clear_runtime_params(node.params)
+                    if node.type_name == "frame_source":
+                        node.params["snapshot"] = snapshot
+                    if node.type_name == "sqlite_log":
+                        node.params.update(
+                            {
+                                "_node_id": node.node_id,
+                                "_run_id": run_id,
+                                "_frame_id": snapshot.frame_id,
+                                **runtime_context,
+                            }
+                        )
+                    if node.type_name in {"serial_continuity", "serial_generator"}:
+                        node.params.update({"_node_id": node.node_id, **runtime_context})
+                results = graph.execute()
+                return WorkflowRun(run_id=run_id, revision=graph.revision, frame_id=snapshot.frame_id, results=results)
+            finally:
+                for node in graph.nodes.values():
+                    self._clear_runtime_params(node.params)
 
         return self._pool.submit(run)
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
+
+    def _clear_runtime_params(self, params: dict[str, Any]) -> None:
+        for key in list(params.keys()):
+            if key == "snapshot" or key.startswith("_"):
+                params.pop(key, None)

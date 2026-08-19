@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html
 from pathlib import Path
 from typing import Any
 
@@ -183,12 +184,13 @@ class ProductionLogViewer(QWidget):
         left_layout.addWidget(self.records_caption)
 
         self.records = QTreeWidget()
-        self.records.setHeaderLabels([tr("log.column.status_time"), tr("log.column.profile"), tr("log.column.checks")])
+        self.records.setHeaderLabels([tr("log.column.status_time"), tr("log.column.serial"), tr("log.column.profile"), tr("log.column.checks")])
         self.records.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.records.itemSelectionChanged.connect(self._record_selection_changed)
         self.records.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.records.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.records.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.records.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.records.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         left_layout.addWidget(self.records, 1)
         splitter.addWidget(left)
 
@@ -197,12 +199,17 @@ class ProductionLogViewer(QWidget):
         right_layout.setContentsMargins(6, 0, 0, 0)
         right_layout.setSpacing(7)
         self.record_title = QLabel()
+        self.serial_label = QLabel()
+        self.serial_label.setObjectName("serialText")
+        self.serial_label.setTextFormat(Qt.TextFormat.RichText)
+        self.serial_label.setWordWrap(True)
         self.record_meta = QLabel()
         self.record_meta.setObjectName("meta")
         self.record_meta.setWordWrap(True)
         self.detail = QPlainTextEdit()
         self.detail.setReadOnly(True)
         right_layout.addWidget(self.record_title)
+        right_layout.addWidget(self.serial_label)
         right_layout.addWidget(self.record_meta)
         right_layout.addWidget(self.detail, 1)
         splitter.addWidget(right)
@@ -249,7 +256,7 @@ class ProductionLogViewer(QWidget):
         self.title.setText(tr("log.title"))
         self.refresh_button.setText(tr("log.refresh"))
         self.records_caption.setText(tr("log.daily_records"))
-        self.records.setHeaderLabels([tr("log.column.status_time"), tr("log.column.profile"), tr("log.column.checks")])
+        self.records.setHeaderLabels([tr("log.column.status_time"), tr("log.column.serial"), tr("log.column.profile"), tr("log.column.checks")])
         self._update_meta()
         self._update_empty_detail()
 
@@ -394,8 +401,8 @@ class ProductionLogViewer(QWidget):
         self._row_by_id = {row.row_id: row for row in self._rows}
         self.records.clear()
         groups = {
-            True: QTreeWidgetItem([tr("state.ok"), "", "0"]),
-            False: QTreeWidgetItem([tr("state.ng"), "", "0"]),
+            True: QTreeWidgetItem([tr("state.ok"), "", "", "0"]),
+            False: QTreeWidgetItem([tr("state.ng"), "", "", "0"]),
         }
         for group in groups.values():
             group.setFlags(group.flags() & ~Qt.ItemFlag.ItemIsSelectable)
@@ -403,7 +410,7 @@ class ProductionLogViewer(QWidget):
 
         for row in self._rows:
             time_text = row.created_at.replace("T", " ").split(" ")[-1].split("+")[0]
-            item = QTreeWidgetItem([time_text, row.profile_name or row.profile_id, str(self._check_count(row.checks_json))])
+            item = QTreeWidgetItem([time_text, row.serial_text, row.profile_name or row.profile_id, str(self._check_count(row.checks_json))])
             item.setData(0, Qt.ItemDataRole.UserRole, row.row_id)
             item.setToolTip(0, f"#{row.row_id} {row.decision}")
             if row.passed:
@@ -411,10 +418,15 @@ class ProductionLogViewer(QWidget):
             else:
                 item.setForeground(0, QColor("#ff6b7f"))
             groups[row.passed].addChild(item)
+            if row.serial_text:
+                label = QLabel(self._serial_markup(row, compact=True))
+                label.setTextFormat(Qt.TextFormat.RichText)
+                label.setStyleSheet("background: transparent; padding-left: 3px;")
+                self.records.setItemWidget(item, 1, label)
 
         for passed, group in groups.items():
             group.setExpanded(True)
-            group.setText(2, str(group.childCount()))
+            group.setText(3, str(group.childCount()))
             group.setForeground(0, QColor("#7dff91") if passed else QColor("#ff6b7f"))
 
         if self._rows:
@@ -440,6 +452,7 @@ class ProductionLogViewer(QWidget):
         checks = self._check_count(row.checks_json)
         frame = "" if row.frame_id is None else f" | {tr('log.column.frame')} {row.frame_id}"
         self.record_title.setText(f"{status} | {row.created_at.replace('T', ' ')}")
+        self.serial_label.setText(self._serial_html(row))
         self.record_meta.setText(
             f"#{row.row_id} | {row.profile_name or row.profile_id} | {row.source_node} | "
             f"{checks} {tr('log.column.checks')}{frame}"
@@ -453,6 +466,7 @@ class ProductionLogViewer(QWidget):
 
     def _update_empty_detail(self, date_text: str = "") -> None:
         self.record_title.setText(tr("log.empty"))
+        self.serial_label.setText("")
         self.record_meta.setText(date_text)
         self.detail.setPlainText("")
 
@@ -548,3 +562,18 @@ class ProductionLogViewer(QWidget):
         except json.JSONDecodeError:
             return 0
         return len(checks) if isinstance(checks, list) else 0
+
+    def _serial_html(self, row: ProductionLogRow) -> str:
+        if not row.serial_text:
+            return f"<span style='color:#94a3b8'>{html.escape(tr('log.serial'))}: -</span>"
+        return f"<span style='color:#94a3b8'>{html.escape(tr('log.serial'))}: </span>{self._serial_markup(row, compact=False)}"
+
+    def _serial_markup(self, row: ProductionLogRow, compact: bool) -> str:
+        text = row.serial_text
+        start = max(0, min(int(row.serial_start), len(text)))
+        end = max(start, min(int(row.serial_end), len(text)))
+        before = html.escape(text[:start])
+        effective = html.escape(text[start:end])
+        after = html.escape(text[end:])
+        value = "" if compact or row.serial_value is None else f" / {row.serial_value}"
+        return f"<span style='color:#dbeafe'>{before}</span><span style='background-color:#f59e0b;color:#111827;font-weight:700;padding:1px 3px'>{effective}</span><span style='color:#dbeafe'>{after}</span><span style='color:#94a3b8'>{html.escape(value)}</span>"

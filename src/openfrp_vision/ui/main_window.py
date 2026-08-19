@@ -36,6 +36,7 @@ from openfrp_vision.core.i18n import (
     set_language,
     tr,
 )
+from openfrp_vision.core.production_log import reset_serial_state, resolve_log_db_path, save_serial_state, serial_state
 from openfrp_vision.core.profiles import ProfileStore
 from openfrp_vision.ui.camera_preview import CameraGLView
 from openfrp_vision.ui.inspector import NodeInspector
@@ -350,6 +351,8 @@ class MainWindow(QMainWindow):
         self._fps_ema = 0.0
         self._fps_last_publish = 0.0
         self._closing = False
+        self._pending_serial_sample_node_id: str | None = None
+        self._pending_serial_sample_future = None
         self.workbench = CameraWorkbench(self.graph)
         self.setCentralWidget(self.workbench)
         self.setWindowTitle(tr("app.title"))
@@ -382,6 +385,7 @@ class MainWindow(QMainWindow):
         self.workbench.inspector.parameter_changed.connect(self._inspector_parameter_changed)
         self.workbench.inspector.node_enabled_changed.connect(self._inspector_node_enabled_changed)
         self.workbench.inspector.request_roi.connect(self._start_roi_selection)
+        self.workbench.inspector.request_serial_reset.connect(self._reset_serial_node_state)
         self.workbench.roi_overlay_changed.connect(self._roi_overlay_changed)
         self.workbench.result_indicator.settings_changed.connect(self._indicator_settings_changed)
         self.workbench.production_stats.settings_changed.connect(self._stats_settings_changed)
@@ -748,6 +752,8 @@ class MainWindow(QMainWindow):
             self._configure_trigger_action()
             self.statusBar().showMessage(tr("status.trigger_updated", node=node_label(node, self.graph.definitions[node.type_name].title)))
         else:
+            if node.type_name == "serial_generator" and key == "hold" and bool(value):
+                self._sync_generator_hold_state(node_id)
             if node.type_name == "sqlite_log":
                 self.workbench.configure_log_viewer(self.active_profile_id, self._active_log_db_path())
             self.statusBar().showMessage(
@@ -769,6 +775,77 @@ class MainWindow(QMainWindow):
         self.workbench.inspector.inspect(node_id)
         state = tr("state.enabled") if enabled else tr("state.disabled")
         self.statusBar().showMessage(tr("status.node_enabled", node=node_label(node, self.graph.definitions[node.type_name].title), state=state))
+
+    def _reset_serial_node_state(self, node_id: str) -> None:
+        node = self.graph.nodes.get(node_id)
+        if node is None or node.type_name not in {"serial_continuity", "serial_generator"}:
+            return
+        kind = "continuity" if node.type_name == "serial_continuity" else "generator"
+        if node.type_name == "serial_continuity":
+            if self.latest_snapshot is None:
+                self.statusBar().showMessage(tr("status.no_frame"))
+                return
+            if self.state.workflow_busy:
+                self.statusBar().showMessage(tr("status.workflow_busy"))
+                return
+        try:
+            removed = reset_serial_state(resolve_log_db_path(self._active_log_db_path()), self.active_profile_id, node_id, kind)
+        except Exception as exc:
+            self.statusBar().showMessage(tr("status.serial_reset_failed", node=node_label(node, self.graph.definitions[node.type_name].title), error=exc))
+            return
+        if node.type_name == "serial_continuity":
+            self._start_serial_sample_run(node_id, removed)
+            return
+        self.graph.results.pop(node_id, None)
+        self.workbench.overlay.graph_scene.update_results()
+        self.workbench.inspector.refresh_result()
+        self.statusBar().showMessage(
+            tr(
+                "status.serial_reset",
+                node=node_label(node, self.graph.definitions[node.type_name].title),
+                count=removed,
+                profile=self.profile_store.profile_name(self.active_profile_id),
+            )
+        )
+
+    def _sync_generator_hold_state(self, generator_id: str) -> None:
+        generator = self.graph.nodes.get(generator_id)
+        if generator is None or generator.type_name != "serial_generator":
+            return
+        db_path = resolve_log_db_path(self._active_log_db_path())
+        for edge in self.graph.edges:
+            target = self.graph.nodes.get(edge.target)
+            if edge.source != generator_id or target is None or target.type_name != "serial_continuity":
+                continue
+            state = serial_state(db_path, self.active_profile_id, target.node_id, "continuity")
+            if state is None:
+                return
+            save_serial_state(db_path, self.active_profile_id, generator_id, "generator", str(state["text"]), int(state["value"]))
+            return
+
+    def _start_serial_sample_run(self, node_id: str, reset_count: int) -> None:
+        self._pending_serial_sample_node_id = node_id
+        self.dispatch(WorkflowRequested(self.latest_snapshot, self.graph.revision))
+        future = self.executor.submit(
+            self.graph,
+            self.latest_snapshot,
+            {
+                "_profile_id": self.active_profile_id,
+                "_profile_name": self.profile_store.profile_name(self.active_profile_id),
+                "_log_db_path": self._active_log_db_path(),
+                "_serial_sample_node_id": node_id,
+                "_suppress_sqlite_log": True,
+            },
+        )
+        self._pending_serial_sample_future = future
+        future.add_done_callback(lambda done: self.workflow_done.emit(done))
+        self.statusBar().showMessage(
+            tr(
+                "status.serial_sample_submitted",
+                node=node_label(self.graph.nodes[node_id], self.graph.definitions[self.graph.nodes[node_id].type_name].title),
+                count=reset_count,
+            )
+        )
 
     def _indicator_settings_changed(self, settings: dict) -> None:
         profile = self.profile_store.data.setdefault("profiles", {}).get(self.active_profile_id)
@@ -845,6 +922,7 @@ class MainWindow(QMainWindow):
             {
                 "_profile_id": self.active_profile_id,
                 "_profile_name": self.profile_store.profile_name(self.active_profile_id),
+                "_log_db_path": self._active_log_db_path(),
             },
         )
         future.add_done_callback(lambda done: self.workflow_done.emit(done))
@@ -854,8 +932,20 @@ class MainWindow(QMainWindow):
         try:
             run: WorkflowRun = future.result()
         except Exception as exc:
+            if future is self._pending_serial_sample_future:
+                self._pending_serial_sample_future = None
+                self._pending_serial_sample_node_id = None
             self.state.workflow_busy = False
             self.statusBar().showMessage(tr("status.workflow_failed", error=exc))
+            return
+        if future is self._pending_serial_sample_future:
+            self._pending_serial_sample_future = None
+            node_id = self._pending_serial_sample_node_id
+            self._pending_serial_sample_node_id = None
+            self.state.workflow_busy = False
+            self.workbench.overlay.graph_scene.update_results()
+            if node_id is not None:
+                self._complete_serial_sample(node_id, run)
             return
         final_result = self._aggregate_result(run)
         passed = bool(final_result.get("passed", False))
@@ -868,6 +958,42 @@ class MainWindow(QMainWindow):
             self.workbench.production_log_viewer.refresh()
         self.workbench.result_indicator.blink(passed)
         self.statusBar().showMessage(tr("status.workflow_done", decision=final_result.get("decision", "DONE"), frame=run.frame_id))
+
+    def _complete_serial_sample(self, node_id: str, run: WorkflowRun) -> None:
+        node = self.graph.nodes.get(node_id)
+        result = run.results.get(node_id)
+        if node is None or result is None:
+            self.statusBar().showMessage(tr("status.serial_sample_failed", node=node_id, error="no result"))
+            return
+        value = result.value
+        text = ""
+        if isinstance(value, dict):
+            text = str(value.get("text", ""))
+        elif value is not None:
+            text = str(value)
+        text = text.replace("\n", "").strip()
+        if not text:
+            self.statusBar().showMessage(
+                tr("status.serial_sample_failed", node=node_label(node, self.graph.definitions[node.type_name].title), error="empty text")
+            )
+            return
+        old_start = int(node.params.get("segment_start", 0) or 0)
+        old_end = int(node.params.get("segment_end", min(len(text), old_start + 1)) or min(len(text), old_start + 1))
+        node.params["sample_text"] = text
+        node.params["serial_length"] = len(text)
+        node.params["segment_start"] = max(0, min(old_start, len(text)))
+        node.params["segment_end"] = max(node.params["segment_start"], min(old_end, len(text)))
+        self.graph.revision += 1
+        self.workbench.overlay.graph_scene.update_results()
+        self.workbench.inspector.inspect(node_id)
+        self._save_active_profile(silent=True)
+        self.statusBar().showMessage(
+            tr(
+                "status.serial_sample_latched",
+                node=node_label(node, self.graph.definitions[node.type_name].title),
+                text=text,
+            )
+        )
 
     def _active_log_db_path(self) -> str:
         for node in self.graph.nodes.values():

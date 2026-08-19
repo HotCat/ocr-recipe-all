@@ -29,10 +29,65 @@ from openfrp_vision.ui.camera_preview import CameraGLView
 from openfrp_vision.workflow.model import RecipeGraph
 
 
+class SerialSegmentEditor(QWidget):
+    changed = Signal(str, object)
+
+    def __init__(self, params: dict[str, Any], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._updating = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        self.sample = QPlainTextEdit(str(params.get("sample_text", "")))
+        self.sample.setMaximumHeight(58)
+        self.sample.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color: #cbd5e1; font-size: 10px;")
+        layout.addWidget(self.sample)
+        layout.addWidget(self.hint)
+        self._set_hint(int(params.get("segment_start", 0) or 0), int(params.get("segment_end", 0) or 0))
+        self.sample.textChanged.connect(self._text_changed)
+        self.sample.selectionChanged.connect(self._selection_changed)
+
+    def _text_changed(self) -> None:
+        if self._updating:
+            return
+        text = self._text()
+        self.changed.emit("sample_text", text)
+        self.changed.emit("serial_length", len(text))
+        cursor = self.sample.textCursor()
+        if cursor.hasSelection():
+            self._emit_selection(cursor.selectionStart(), cursor.selectionEnd())
+
+    def _selection_changed(self) -> None:
+        if self._updating:
+            return
+        cursor = self.sample.textCursor()
+        if cursor.hasSelection():
+            self._emit_selection(cursor.selectionStart(), cursor.selectionEnd())
+
+    def _emit_selection(self, start: int, end: int) -> None:
+        start, end = sorted((max(0, int(start)), max(0, int(end))))
+        self.changed.emit("segment_start", start)
+        self.changed.emit("segment_end", end)
+        self.changed.emit("serial_length", len(self._text()))
+        self._set_hint(start, end)
+
+    def _set_hint(self, start: int, end: int) -> None:
+        text = self._text()
+        effective = text[start:end] if 0 <= start <= end <= len(text) else ""
+        self.hint.setText(tr("inspector.serial_segment", start=start, end=end, length=len(text), effective=effective))
+
+    def _text(self) -> str:
+        return self.sample.toPlainText().replace("\n", "")
+
+
 class NodeInspector(QWidget):
     parameter_changed = Signal(str, str, object)
     node_enabled_changed = Signal(str, bool)
     request_roi = Signal(str)
+    request_serial_reset = Signal(str)
 
     def __init__(self, graph: RecipeGraph, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -115,8 +170,12 @@ class NodeInspector(QWidget):
         self.roi_button = QPushButton()
         self.roi_button.setVisible(False)
         self.roi_button.clicked.connect(self._request_roi)
+        self.reset_serial_button = QPushButton()
+        self.reset_serial_button.setVisible(False)
+        self.reset_serial_button.clicked.connect(self._request_serial_reset)
         header.addWidget(self.section_label)
         header.addStretch(1)
+        header.addWidget(self.reset_serial_button)
         header.addWidget(self.roi_button)
         layout.addLayout(header)
 
@@ -177,6 +236,7 @@ class NodeInspector(QWidget):
     def retranslate(self) -> None:
         self.section_label.setText(tr("inspector.title"))
         self.roi_button.setText(tr("inspector.pick_roi"))
+        self.reset_serial_button.setText(tr("inspector.reset_serial"))
         self.enabled_check.setText(tr("inspector.enabled"))
         self.params_title.setText(tr("inspector.parameters"))
         self.preview_title.setText(tr("inspector.preview"))
@@ -192,6 +252,7 @@ class NodeInspector(QWidget):
             self.node_meta.setText(tr("inspector.no_node_hint"))
             self.enabled_check.setVisible(False)
             self.roi_button.setVisible(False)
+            self.reset_serial_button.setVisible(False)
             self.preview.setPixmap(QPixmap())
             self.preview.setText(tr("inspector.no_preview"))
             self.output.clear()
@@ -213,8 +274,13 @@ class NodeInspector(QWidget):
         self.enabled_check.blockSignals(blocked)
         self.enabled_check.setVisible(True)
         self.roi_button.setVisible(node.type_name == "roi")
+        self.reset_serial_button.setVisible(node.type_name in {"serial_continuity", "serial_generator"})
         for key, value in node.params.items():
-            if key == "snapshot":
+            if key == "snapshot" or key.startswith("_"):
+                continue
+            if node.type_name in {"serial_continuity", "serial_generator"} and key in {"serial_length", "segment_start", "segment_end"}:
+                continue
+            if node.type_name == "serial_continuity" and key == "accept_first":
                 continue
             widget = self._parameter_widget(self.current_node_id, node.type_name, key, value)
             self._parameter_widgets[key] = widget
@@ -402,6 +468,12 @@ class NodeInspector(QWidget):
         self._parameter_widgets.clear()
 
     def _parameter_widget(self, node_id: str, node_type: str, key: str, value: Any) -> QWidget:
+        if node_type in {"serial_continuity", "serial_generator"} and key == "sample_text":
+            node = self.graph.nodes[node_id]
+            editor = SerialSegmentEditor(node.params)
+            editor.changed.connect(lambda changed_key, changed_value: self.parameter_changed.emit(node_id, changed_key, changed_value))
+            return editor
+
         options = self._combo_options(node_type, key)
         if options:
             combo = QComboBox()
@@ -443,6 +515,10 @@ class NodeInspector(QWidget):
     def _request_roi(self) -> None:
         if self.current_node_id is not None:
             self.request_roi.emit(self.current_node_id)
+
+    def _request_serial_reset(self) -> None:
+        if self.current_node_id is not None:
+            self.request_serial_reset.emit(self.current_node_id)
 
     def _enabled_changed(self, enabled: bool) -> None:
         if self.current_node_id is not None:

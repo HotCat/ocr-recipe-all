@@ -234,7 +234,7 @@ class RecipeGraph:
                     "params": {
                         key: copy.deepcopy(value)
                         for key, value in node.params.items()
-                        if key != "snapshot" and not key.startswith("_")
+                        if key != "snapshot" and not key.startswith("_") and not (node.type_name == "serial_continuity" and key == "accept_first")
                     },
                 }
                 for node in self.nodes.values()
@@ -257,6 +257,8 @@ class RecipeGraph:
             title = str(item.get("title") or definitions[type_name].title)
             position = item.get("position", [0, 0])
             params = dict(item.get("params", {}))
+            if type_name == "serial_continuity":
+                params.pop("accept_first", None)
             enabled = bool(item.get("enabled", True))
             graph.add_node(RecipeNode(node_id, type_name, title, float(position[0]), float(position[1]), params, enabled))
 
