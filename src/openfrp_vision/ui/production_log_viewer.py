@@ -410,9 +410,11 @@ class ProductionLogViewer(QWidget):
 
         for row in self._rows:
             time_text = row.created_at.replace("T", " ").split(" ")[-1].split("+")[0]
-            item = QTreeWidgetItem([time_text, row.serial_text, row.profile_name or row.profile_id, str(self._check_count(row.checks_json))])
+            item = QTreeWidgetItem([time_text, "", row.profile_name or row.profile_id, str(self._check_count(row.checks_json))])
             item.setData(0, Qt.ItemDataRole.UserRole, row.row_id)
             item.setToolTip(0, f"#{row.row_id} {row.decision}")
+            if row.serial_text:
+                item.setToolTip(1, row.serial_text)
             if row.passed:
                 item.setForeground(0, QColor("#7dff91"))
             else:
@@ -421,6 +423,8 @@ class ProductionLogViewer(QWidget):
             if row.serial_text:
                 label = QLabel(self._serial_markup(row, compact=True))
                 label.setTextFormat(Qt.TextFormat.RichText)
+                label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                label.setWordWrap(False)
                 label.setStyleSheet("background: transparent; padding-left: 3px;")
                 self.records.setItemWidget(item, 1, label)
 
@@ -576,4 +580,4 @@ class ProductionLogViewer(QWidget):
         effective = html.escape(text[start:end])
         after = html.escape(text[end:])
         value = "" if compact or row.serial_value is None else f" / {row.serial_value}"
-        return f"<span style='color:#dbeafe'>{before}</span><span style='background-color:#f59e0b;color:#111827;font-weight:700;padding:1px 3px'>{effective}</span><span style='color:#dbeafe'>{after}</span><span style='color:#94a3b8'>{html.escape(value)}</span>"
+        return f"<span style='color:#dbeafe'>{before}</span><span style='background-color:#f59e0b;color:#111827;font-weight:700'>{effective}</span><span style='color:#dbeafe'>{after}</span><span style='color:#94a3b8'>{html.escape(value)}</span>"
