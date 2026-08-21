@@ -36,6 +36,7 @@ from openfrp_vision.core.i18n import (
     set_language,
     tr,
 )
+from openfrp_vision.core import modbus_client
 from openfrp_vision.core.production_log import reset_serial_state, resolve_log_db_path, save_serial_state, serial_state
 from openfrp_vision.core.profiles import ProfileStore
 from openfrp_vision.ui.camera_preview import CameraGLView
@@ -104,12 +105,14 @@ class CameraWorkbench(QWidget):
         self.zoom_out_button = QPushButton("-")
         self.zoom_in_button = QPushButton("+")
         self.zoom_fit_button = QPushButton()
+        self.arrange_button = QPushButton()
         self.zoom_reset_button = QPushButton("100%")
         self.toggle_button = QPushButton()
         for button in (self.zoom_out_button, self.zoom_in_button):
             button.setFixedWidth(30)
-        for button in (self.zoom_fit_button, self.zoom_reset_button):
-            button.setFixedWidth(44)
+        self.zoom_fit_button.setFixedWidth(44)
+        self.arrange_button.setFixedWidth(70)
+        self.zoom_reset_button.setFixedWidth(44)
         hud_layout.addWidget(self.mode_label)
         hud_layout.addWidget(self.camera_label)
         hud_layout.addWidget(self.shortcut_label)
@@ -129,6 +132,7 @@ class CameraWorkbench(QWidget):
         hud_layout.addWidget(self.zoom_out_button)
         hud_layout.addWidget(self.zoom_in_button)
         hud_layout.addWidget(self.zoom_fit_button)
+        hud_layout.addWidget(self.arrange_button)
         hud_layout.addWidget(self.zoom_reset_button)
         hud_layout.addWidget(self.toggle_button)
         self.hud.setFixedHeight(46)
@@ -241,6 +245,7 @@ class CameraWorkbench(QWidget):
         self.stats_button.setText(tr("hud.stats"))
         self.logs_button.setText(tr("hud.logs"))
         self.zoom_fit_button.setText(tr("hud.fit"))
+        self.arrange_button.setText(tr("hud.arrange"))
         self.toggle_button.setText(tr("hud.overlay"))
         self.set_run_shortcut(self._run_shortcut)
         self.set_language_choices(current_language())
@@ -353,6 +358,9 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._pending_serial_sample_node_id: str | None = None
         self._pending_serial_sample_future = None
+        self._last_modbus_trigger_ready = False
+        self._last_modbus_trigger_fire = 0.0
+        self._last_modbus_error_at = 0.0
         self.workbench = CameraWorkbench(self.graph)
         self.setCentralWidget(self.workbench)
         self.setWindowTitle(tr("app.title"))
@@ -374,6 +382,7 @@ class MainWindow(QMainWindow):
         self.workbench.zoom_out_button.clicked.connect(self.workbench.overlay.zoom_out)
         self.workbench.zoom_in_button.clicked.connect(self.workbench.overlay.zoom_in)
         self.workbench.zoom_fit_button.clicked.connect(self.workbench.overlay.fit_to_nodes)
+        self.workbench.arrange_button.clicked.connect(self._auto_arrange_graph)
         self.workbench.zoom_reset_button.clicked.connect(self.workbench.overlay.reset_zoom)
         self.workbench.camera.roi_selected.connect(self._roi_selected)
         self.workbench.apply_overlay_mode(self.state.overlay_mode)
@@ -405,6 +414,8 @@ class MainWindow(QMainWindow):
         self._run_action = QAction(tr("action.trigger_workflow"), self)
         self._run_action.triggered.connect(self._trigger_workflow)
         self.addAction(self._run_action)
+        self._modbus_trigger_timer = QTimer(self)
+        self._modbus_trigger_timer.timeout.connect(self._modbus_trigger_tick)
         self._configure_trigger_action()
         self._apply_active_profile_camera_settings()
         QTimer.singleShot(0, self._warm_active_profile_ocr)
@@ -436,6 +447,9 @@ class MainWindow(QMainWindow):
         current = self.workbench.inspector.current_node_id
         if current in self.graph.nodes:
             self.workbench.inspector.inspect(current)
+
+    def _auto_arrange_graph(self) -> None:
+        self.workbench.overlay.auto_arrange()
 
     def _populate_profiles(self) -> None:
         profiles = [(profile_id, self.profile_store.profile_name(profile_id)) for profile_id in self.profile_store.profile_ids()]
@@ -896,6 +910,17 @@ class MainWindow(QMainWindow):
         source = str(params.get("source", "keyboard"))
         shortcut = str(params.get("shortcut", "Ctrl+Return"))
         armed = bool(params.get("armed", True)) and bool(node.enabled if node is not None else True)
+        if source == "modbus" and armed:
+            interval = max(20, int(params.get("modbus_poll_ms", 100) or 100))
+            if self._modbus_trigger_timer.interval() != interval:
+                self._modbus_trigger_timer.setInterval(interval)
+            if not self._modbus_trigger_timer.isActive():
+                self._modbus_trigger_timer.start()
+            self._run_action.setShortcut(QKeySequence())
+            self.workbench.set_run_shortcut(f"modbus {interval} ms")
+            return
+        self._modbus_trigger_timer.stop()
+        self._last_modbus_trigger_ready = False
         if source == "keyboard" and armed:
             self._run_action.setShortcut(QKeySequence(shortcut))
             self.workbench.set_run_shortcut(shortcut)
@@ -903,6 +928,36 @@ class MainWindow(QMainWindow):
             self._run_action.setShortcut(QKeySequence())
             label = "disabled" if not armed else source
             self.workbench.set_run_shortcut(label)
+
+    def _modbus_trigger_tick(self) -> None:
+        node = self.graph.nodes.get("trigger")
+        if node is None or not node.enabled or str(node.params.get("source", "keyboard")) != "modbus" or not bool(node.params.get("armed", True)):
+            self._configure_trigger_action()
+            return
+        try:
+            ready = modbus_client.read_trigger(node.params)
+        except Exception as exc:
+            self._last_modbus_trigger_ready = False
+            now = time.monotonic()
+            if now - self._last_modbus_error_at > 2.0:
+                self._last_modbus_error_at = now
+                self.statusBar().showMessage(tr("status.modbus_trigger_failed", error=exc))
+            return
+        if not ready:
+            self._last_modbus_trigger_ready = False
+            return
+        if self._last_modbus_trigger_ready:
+            return
+        now = time.monotonic()
+        debounce_s = max(0.0, int(node.params.get("debounce_ms", 250) or 250) / 1000.0)
+        if now - self._last_modbus_trigger_fire < debounce_s:
+            return
+        if self.latest_snapshot is None or self.state.workflow_busy:
+            return
+        self._last_modbus_trigger_ready = True
+        self._last_modbus_trigger_fire = now
+        self.statusBar().showMessage(tr("status.modbus_triggered"))
+        self._trigger_workflow()
 
     def _trigger_workflow(self) -> None:
         trigger_node = self.graph.nodes.get("trigger")
@@ -1040,4 +1095,5 @@ class MainWindow(QMainWindow):
         self.camera_adapter.stop()
         self.executor.shutdown()
         shutdown_paddle_worker()
+        modbus_client.close_all()
         super().closeEvent(event)

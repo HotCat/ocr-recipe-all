@@ -526,7 +526,11 @@ class NodeInspector(QWidget):
 
     def _combo_options(self, node_type: str, key: str) -> list[str]:
         if node_type == "trigger_switch" and key == "source":
-            return ["keyboard", "external", "manual"]
+            return ["keyboard", "modbus", "external", "manual"]
+        if key == "modbus_protocol":
+            return ["rtu", "tcp"]
+        if key == "modbus_parity":
+            return ["N", "E", "O"]
         if node_type == "ocr" and key == "lang":
             return ["en", "ch"]
         if node_type == "ocr" and key == "run_mode":
@@ -546,6 +550,27 @@ class NodeInspector(QWidget):
             return 1, 500, 1, ""
         if node_type == "camera_settings" and key == "analog_gain":
             return 0, 100, 1, ""
+        if key == "modbus_baudrate":
+            return 300, 2_000_000, 100, ""
+        if key in {"modbus_bytesize", "modbus_stopbits"}:
+            return 1, 8, 1, ""
+        if key == "modbus_slave":
+            return 1, 247, 1, ""
+        if key == "modbus_tcp_port":
+            return 1, 65_535, 1, ""
+        if key in {
+            "modbus_timeout_ms",
+            "modbus_poll_ms",
+        }:
+            return 10, 10_000, 10, " ms"
+        if key in {
+            "modbus_trigger_register",
+            "modbus_trigger_value",
+            "modbus_ok_register",
+            "modbus_ng_register",
+            "modbus_write_value",
+        }:
+            return 0, 65_535, 1, ""
         if key in {"x", "y", "width", "height"}:
             return 0, 100_000, 1, " px"
         if "threshold" in key:

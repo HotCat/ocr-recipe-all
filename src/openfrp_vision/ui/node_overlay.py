@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
@@ -12,7 +13,14 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
+    QDialog,
+    QDialogButtonBox,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
     QMenu,
+    QPushButton,
+    QVBoxLayout,
 )
 
 from openfrp_vision.core.events import OverlayMode
@@ -61,6 +69,57 @@ class WorkflowGroupItem(QGraphicsRectItem):
         painter.setPen(QColor(225, 235, 245, 105))
         painter.setFont(QFont("Arial", 9, QFont.Weight.DemiBold))
         painter.drawText(rect.adjusted(14, 10, -14, -10), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, tr("graph.group"))
+
+
+class NodeGroupItem(QGraphicsRectItem):
+    def __init__(self, group_id: str, title: str) -> None:
+        super().__init__()
+        self.group_id = group_id
+        self.title = title
+        self.member_count = 0
+        self.member_preview = ""
+        self.setZValue(-10)
+        self.setPen(QPen(QColor(96, 165, 250, 150), 1.4, Qt.PenStyle.DashLine))
+        self.setBrush(QColor(14, 23, 37, 58))
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+    def set_title(self, title: str) -> None:
+        self.title = title
+        self.update()
+
+    def set_member_count(self, count: int) -> None:
+        self.member_count = count
+        self.update()
+
+    def set_member_preview(self, preview: str) -> None:
+        self.member_preview = preview
+        self.update()
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # type: ignore[no-untyped-def]
+        del option, widget
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        painter.setPen(self.pen())
+        painter.setBrush(self.brush())
+        painter.drawRoundedRect(rect, 8, 8)
+
+        header = QRectF(rect.left() + 8, rect.top() + 8, min(rect.width() - 16, 320), 42)
+        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        painter.setBrush(QColor(8, 13, 20, 175))
+        painter.drawRoundedRect(header, 6, 6)
+
+        painter.setPen(QColor("#e2e8f0"))
+        painter.setFont(QFont("Arial", 9, QFont.Weight.DemiBold))
+        title_rect = header.adjusted(10, 5, -10, -18)
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.title)
+
+        painter.setPen(QColor("#93c5fd"))
+        painter.setFont(QFont("Arial", 8))
+        subtitle = f"{self.member_count} node(s)"
+        if self.member_preview:
+            subtitle = f"{subtitle}  {self.member_preview}"
+        count_rect = header.adjusted(10, 20, -10, -4)
+        painter.drawText(count_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, subtitle)
 
 
 class PortItem(QGraphicsObject):
@@ -236,9 +295,18 @@ class EdgeItem(QGraphicsPathItem):
     def update_path(self) -> None:
         start = self.source_port.scene_center()
         end = self.target_port.scene_center()
-        distance = max(80.0, abs(end.x() - start.x()) * 0.48)
+        edge_style = getattr(self.source_port.node_item.graph, "edge_style", "curved")
         path = QPainterPath(start)
-        path.cubicTo(start.x() + distance, start.y(), end.x() - distance, end.y(), end.x(), end.y())
+        if edge_style == "segmented":
+            delta_x = end.x() - start.x()
+            offset = max(42.0, abs(delta_x) * 0.45)
+            elbow_x = start.x() + offset if delta_x >= 0 else start.x() - offset
+            path.lineTo(elbow_x, start.y())
+            path.lineTo(elbow_x, end.y())
+            path.lineTo(end)
+        else:
+            distance = max(80.0, abs(end.x() - start.x()) * 0.48)
+            path.cubicTo(start.x() + distance, start.y(), end.x() - distance, end.y(), end.x(), end.y())
         self.setPath(path)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:  # type: ignore[no-untyped-def]
@@ -265,6 +333,7 @@ class GraphScene(QGraphicsScene):
         self.graph = graph
         self.node_items: dict[str, NodeItem] = {}
         self.edge_items: list[EdgeItem] = []
+        self.group_items: dict[str, NodeGroupItem] = {}
         self.pending_port: PortItem | None = None
         self.group_item = WorkflowGroupItem()
         self.rebuild()
@@ -288,9 +357,14 @@ class GraphScene(QGraphicsScene):
         self.clear()
         self.node_items = {}
         self.edge_items = []
+        self.group_items = {}
         self.pending_port = None
         self.group_item = WorkflowGroupItem()
         self.addItem(self.group_item)
+        for group_id, group in self.graph.groups.items():
+            group_item = NodeGroupItem(group_id, group.title)
+            self.addItem(group_item)
+            self.group_items[group_id] = group_item
         for node_id in self.graph.nodes:
             node_item = NodeItem(self.graph, node_id)
             self.addItem(node_item)
@@ -353,11 +427,119 @@ class GraphScene(QGraphicsScene):
     def update_group_bounds(self) -> None:
         rect = self.workflow_rect().adjusted(-70, -70, 70, 90)
         self.group_item.setRect(rect)
+        for group_id, group in self.graph.groups.items():
+            group_item = self.group_items.get(group_id)
+            if group_item is None:
+                continue
+            nodes = [self.node_items.get(node_id) for node_id in group.node_ids]
+            nodes = [item for item in nodes if item is not None]
+            if len(nodes) < 2:
+                group_item.setVisible(False)
+                continue
+            bounds = QRectF()
+            preview_titles: list[str] = []
+            for item in nodes:
+                item_rect = item.mapRectToScene(item.boundingRect())
+                bounds = item_rect if bounds.isNull() else bounds.united(item_rect)
+                if len(preview_titles) < 3:
+                    preview_titles.append(node_label(item.node, self.graph.definitions[item.node.type_name].title))
+            bounds = bounds.adjusted(-16, -20, 16, 16)
+            group_item.setRect(bounds)
+            group_item.setVisible(True)
+            group_item.set_member_count(len(nodes))
+            group_item.set_title(group.title)
+            group_item.set_member_preview(" • ".join(preview_titles))
         self.setSceneRect(rect.adjusted(-900, -650, 900, 650))
 
     def update_results(self) -> None:
         for item in self.node_items.values():
             item.update_result()
+
+    def set_edge_style(self, style: str) -> None:
+        self.graph.set_edge_style(style)
+        self.rebuild()
+        label = tr("menu.curved_connections") if style == "curved" else tr("menu.segmented_connections")
+        self.message.emit(tr("graph.edge_style_changed", style=label))
+
+    def group_selected_nodes(self, title: str) -> None:
+        node_ids = [item.node_id for item in self.selectedItems() if isinstance(item, NodeItem)]
+        self.group_nodes(node_ids, title)
+
+    def group_nodes(self, node_ids: list[str], title: str) -> None:
+        try:
+            self.graph.group_nodes(node_ids, title)
+        except GraphError as exc:
+            self.message.emit(str(exc))
+            return
+        self.graph.results.clear()
+        self.rebuild()
+        self.message.emit(tr("graph.group_created"))
+
+    def ungroup_selected_nodes(self) -> None:
+        node_ids = [item.node_id for item in self.selectedItems() if isinstance(item, NodeItem)]
+        removed = self.graph.ungroup_nodes(node_ids)
+        if removed:
+            self.graph.results.clear()
+            self.rebuild()
+            self.message.emit(tr("graph.group_removed"))
+
+    def auto_arrange(self) -> bool:
+        if not self.graph.nodes:
+            return False
+        incoming: dict[str, list[str]] = {node_id: [] for node_id in self.graph.nodes}
+        for edge in self.graph.edges:
+            incoming.setdefault(edge.target, []).append(edge.source)
+        try:
+            topo = self.graph.topological_order()
+        except GraphError as exc:
+            self.message.emit(str(exc))
+            return False
+
+        levels: dict[str, int] = {}
+        for node_id in topo:
+            parents = incoming.get(node_id, [])
+            if parents:
+                levels[node_id] = max(levels.get(parent, 0) + 1 for parent in parents)
+            else:
+                levels[node_id] = 0
+
+        grouped: dict[int, list[str]] = defaultdict(list)
+        for node_id in topo:
+            grouped[levels[node_id]].append(node_id)
+
+        category_order = {"Input": 0, "Camera": 1, "Image": 2, "Recognition": 3, "Decision": 4, "Output": 5}
+        x_gap = 300.0
+        y_gap = 170.0
+        origin_x = 70.0
+        origin_y = 70.0
+        moved = False
+        for level in sorted(grouped):
+            node_ids = grouped[level]
+            node_ids.sort(
+                key=lambda node_id: (
+                    category_order.get(self.graph.definitions[self.graph.nodes[node_id].type_name].category, 99),
+                    self.graph.nodes[node_id].title.lower(),
+                    node_id,
+                )
+            )
+            for row, node_id in enumerate(node_ids):
+                node = self.graph.nodes[node_id]
+                x = origin_x + level * x_gap
+                y = origin_y + row * y_gap
+                if node.x != x or node.y != y:
+                    moved = True
+                node.x = x
+                node.y = y
+                item = self.node_items.get(node_id)
+                if item is not None:
+                    item.setPos(x, y)
+
+        self.update_group_bounds()
+        if moved:
+            self.graph.revision += 1
+            self.graph_changed.emit()
+        self.message.emit(tr("graph.auto_arranged"))
+        return moved
 
     def delete_selection(self) -> None:
         selected = list(self.selectedItems())
@@ -458,6 +640,80 @@ class NodeOverlayView(QGraphicsView):
             return
         self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
         self._zoom = max(self._min_zoom, min(self._max_zoom, float(self.transform().m11())))
+
+    def auto_arrange(self) -> bool:
+        moved = self.graph_scene.auto_arrange()
+        if moved:
+            self.fit_to_nodes()
+        return moved
+
+    def _group_selected_nodes(self) -> None:
+        node_ids = [item.node_id for item in self.graph_scene.selectedItems() if isinstance(item, NodeItem)]
+        if len(node_ids) < 2:
+            return
+        dialog = QDialog(self)
+        dialog.setObjectName("groupDialog")
+        dialog.setWindowTitle(tr("dialog.group.title"))
+        dialog.setModal(True)
+        dialog.setStyleSheet(
+            """
+            QDialog#groupDialog {
+                background: #111827;
+            }
+            QLabel {
+                color: #e5edf4;
+                font-weight: 600;
+            }
+            QLineEdit {
+                background: #0f172a;
+                color: #f8fafc;
+                border: 1px solid #f97316;
+                border-radius: 4px;
+                padding: 6px 8px;
+                selection-background-color: #f97316;
+            }
+            QPushButton {
+                background: #0f172a;
+                color: #f8fafc;
+                border: 1px solid #f97316;
+                border-radius: 4px;
+                padding: 5px 12px;
+                min-width: 72px;
+            }
+            QPushButton:hover {
+                background: #1f2937;
+            }
+            """
+        )
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel(tr("dialog.group.label")))
+        edit = QLineEdit(tr("dialog.group.default"))
+        layout.addWidget(edit)
+        buttons = QDialogButtonBox()
+        cancel_button = QPushButton(tr("dialog.cancel"))
+        ok_button = QPushButton(tr("dialog.ok"))
+        buttons.addButton(cancel_button, QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.addButton(ok_button, QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_button.clicked.connect(dialog.reject)
+        ok_button.clicked.connect(dialog.accept)
+        layout.addWidget(buttons)
+        edit.selectAll()
+        edit.setFocus()
+        if not dialog.exec():
+            return
+        self.graph_scene.group_nodes(node_ids, edit.text().strip() or tr("dialog.group.default"))
+
+    def _ungroup_selected_nodes(self) -> None:
+        node_ids = [item.node_id for item in self.graph_scene.selectedItems() if isinstance(item, NodeItem)]
+        if not node_ids:
+            return
+        removed = self.graph_scene.graph.ungroup_nodes(node_ids)
+        if removed:
+            self.graph_scene.graph.results.clear()
+            self.graph_scene.rebuild()
+            self.graph_scene.message.emit(tr("graph.group_removed"))
 
     def _scale_by(self, factor: float) -> None:
         target = max(self._min_zoom, min(self._max_zoom, self._zoom * factor))
@@ -611,6 +867,22 @@ class NodeOverlayView(QGraphicsView):
         selected_nodes = [
             item.node_id for item in self.graph_scene.selectedItems() if isinstance(item, NodeItem)
         ]
+        grouped_nodes = {node_id for group in self.graph_scene.graph.groups.values() for node_id in group.node_ids}
+        connections = menu.addMenu(tr("menu.connection_style"))
+        curved_action = connections.addAction(tr("menu.curved_connections"))
+        curved_action.setCheckable(True)
+        curved_action.setChecked(self.graph_scene.graph.edge_style == "curved")
+        curved_action.triggered.connect(lambda _checked=False: self.graph_scene.set_edge_style("curved"))
+        segmented_action = connections.addAction(tr("menu.segmented_connections"))
+        segmented_action.setCheckable(True)
+        segmented_action.setChecked(self.graph_scene.graph.edge_style == "segmented")
+        segmented_action.triggered.connect(lambda _checked=False: self.graph_scene.set_edge_style("segmented"))
+        if selected_nodes:
+            menu.addSeparator()
+            group_action = menu.addAction(tr("menu.group_selected"), self._group_selected_nodes)
+            group_action.setEnabled(len(selected_nodes) >= 2 and not any(node_id in grouped_nodes for node_id in selected_nodes))
+            ungroup_action = menu.addAction(tr("menu.ungroup_selected"), self._ungroup_selected_nodes)
+            ungroup_action.setEnabled(any(node_id in grouped_nodes for node_id in selected_nodes))
         if selected_nodes:
             if any(not self.graph_scene.graph.nodes[node_id].enabled for node_id in selected_nodes):
                 menu.addAction(tr("menu.enable_selected"), lambda _checked=False: self.graph_scene.set_selection_enabled(True))
@@ -618,6 +890,8 @@ class NodeOverlayView(QGraphicsView):
                 menu.addAction(tr("menu.disable_selected"), lambda _checked=False: self.graph_scene.set_selection_enabled(False))
             menu.addAction(tr("menu.toggle_selected"), self.graph_scene.toggle_selection_enabled)
             menu.addSeparator()
+        menu.addAction(tr("menu.auto_arrange"), self.auto_arrange)
+        menu.addSeparator()
         add_menu = menu.addMenu(tr("menu.add_node"))
         scene_pos = self.mapToScene(event.pos())
         for type_name, definition in sorted(self.graph_scene.graph.definitions.items(), key=lambda item: (item[1].category, item[1].title)):

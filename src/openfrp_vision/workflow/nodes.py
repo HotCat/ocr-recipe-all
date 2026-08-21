@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from openfrp_vision.camera.base import FrameSnapshot
+from openfrp_vision.core import modbus_client
 from openfrp_vision.core.production_log import insert_result, resolve_log_db_path, save_serial_state, serial_state
 from openfrp_vision.workflow.model import NodeDefinition, NodeResult, PortSpec, PortType, RecipeGraph, RecipeNode
 
@@ -286,8 +287,13 @@ def _trigger_switch(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResul
         "external_topic": str(params.get("external_topic", "")),
         "debounce_ms": int(params.get("debounce_ms", 250)),
         "armed": bool(params.get("armed", True)),
+        "modbus_protocol": str(params.get("modbus_protocol", "rtu")),
+        "modbus_trigger_register": int(params.get("modbus_trigger_register", 100) or 100),
+        "modbus_trigger_value": int(params.get("modbus_trigger_value", 999) or 999),
     }
     label = trigger["shortcut"] if trigger["source"] == "keyboard" else trigger["source"]
+    if trigger["source"] == "modbus":
+        label = f"Modbus R{trigger['modbus_trigger_register']}={trigger['modbus_trigger_value']}"
     state = "armed" if trigger["armed"] else "disabled"
     return NodeResult(trigger, summary=f"{label} {state}")
 
@@ -1220,6 +1226,20 @@ def _sqlite_log(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
     return NodeResult(result, summary=f"SQLite logged #{row_id} {decision}")
 
 
+def _modbus_output(inputs: dict[str, Any], params: dict[str, Any]) -> NodeResult:
+    result = dict(inputs["result"])
+    if not bool(params.get("write_enabled", True)):
+        return NodeResult(result, summary="Modbus output disabled")
+    passed = bool(result.get("passed", False))
+    try:
+        address, value = modbus_client.write_decision(params, passed)
+    except Exception as exc:
+        result["_modbus_error"] = str(exc)
+        return NodeResult(result, summary=f"Modbus output failed: {exc}")
+    decision = "OK" if passed else "NG"
+    return NodeResult(result, summary=f"Modbus {decision} -> R{address}={value}")
+
+
 def build_definitions() -> dict[str, NodeDefinition]:
     image_in = (PortSpec("image", PortType.IMAGE),)
     definitions = [
@@ -1274,6 +1294,19 @@ def build_definitions() -> dict[str, NodeDefinition]:
                 "external_topic": "",
                 "debounce_ms": 250,
                 "armed": True,
+                "modbus_protocol": "rtu",
+                "modbus_serial_port": "/dev/ttyUSB0",
+                "modbus_baudrate": 9600,
+                "modbus_parity": "N",
+                "modbus_bytesize": 8,
+                "modbus_stopbits": 1,
+                "modbus_host": "192.168.0.68",
+                "modbus_tcp_port": 4998,
+                "modbus_slave": 1,
+                "modbus_timeout_ms": 150,
+                "modbus_poll_ms": 100,
+                "modbus_trigger_register": 100,
+                "modbus_trigger_value": 999,
             },
             _trigger_switch,
             True,
@@ -1317,6 +1350,31 @@ def build_definitions() -> dict[str, NodeDefinition]:
             PortSpec("result", PortType.RESULT),
             {"db_path": "", "write_enabled": True},
             _sqlite_log,
+            True,
+        ),
+        NodeDefinition(
+            "modbus_output",
+            "Modbus Output",
+            "Output",
+            (PortSpec("result", PortType.RESULT),),
+            PortSpec("result", PortType.RESULT),
+            {
+                "write_enabled": True,
+                "modbus_protocol": "rtu",
+                "modbus_serial_port": "/dev/ttyUSB0",
+                "modbus_baudrate": 9600,
+                "modbus_parity": "N",
+                "modbus_bytesize": 8,
+                "modbus_stopbits": 1,
+                "modbus_host": "192.168.0.68",
+                "modbus_tcp_port": 4998,
+                "modbus_slave": 1,
+                "modbus_timeout_ms": 150,
+                "modbus_ok_register": 110,
+                "modbus_ng_register": 120,
+                "modbus_write_value": 999,
+            },
+            _modbus_output,
             True,
         ),
         NodeDefinition(

@@ -67,6 +67,13 @@ class Edge:
     target_port: str
 
 
+@dataclass
+class NodeGroup:
+    group_id: str
+    title: str
+    node_ids: list[str] = field(default_factory=list)
+
+
 class GraphError(ValueError):
     pass
 
@@ -80,6 +87,8 @@ class RecipeGraph:
         self.nodes: dict[str, RecipeNode] = {}
         self.edges: list[Edge] = []
         self.results: dict[str, NodeResult] = {}
+        self.groups: dict[str, NodeGroup] = {}
+        self.edge_style = "curved"
 
     def add_node(self, node: RecipeNode) -> None:
         if node.node_id in self.nodes:
@@ -95,6 +104,14 @@ class RecipeGraph:
         if node_id in self.nodes:
             self.nodes.pop(node_id, None)
             self.edges = [edge for edge in self.edges if edge.source != node_id and edge.target != node_id]
+            removed_groups: list[str] = []
+            for group_id, group in list(self.groups.items()):
+                if node_id in group.node_ids:
+                    group.node_ids = [item for item in group.node_ids if item != node_id]
+                    if len(group.node_ids) < 2:
+                        removed_groups.append(group_id)
+            for group_id in removed_groups:
+                self.groups.pop(group_id, None)
             self.results.pop(node_id, None)
             self.revision += 1
 
@@ -138,6 +155,62 @@ class RecipeGraph:
         if edge in self.edges:
             self.edges.remove(edge)
             self.revision += 1
+
+    def set_edge_style(self, style: str) -> None:
+        style = str(style).lower()
+        if style not in {"curved", "segmented"}:
+            raise GraphError(f"Unsupported edge style: {style}")
+        if self.edge_style != style:
+            self.edge_style = style
+            self.revision += 1
+
+    def group_nodes(self, node_ids: list[str], title: str | None = None) -> str:
+        unique_node_ids = [node_id for node_id in dict.fromkeys(node_ids) if node_id in self.nodes]
+        if len(unique_node_ids) < 2:
+            raise GraphError("A group requires at least two nodes")
+        grouped_nodes = {node_id for group in self.groups.values() for node_id in group.node_ids}
+        if any(node_id in grouped_nodes for node_id in unique_node_ids):
+            raise GraphError("Selected nodes already belong to a group")
+        group_id = self._next_group_id()
+        self.groups[group_id] = NodeGroup(group_id, title or self._default_group_title(), unique_node_ids)
+        self.revision += 1
+        return group_id
+
+    def ungroup_nodes(self, node_ids: list[str]) -> int:
+        targets = set(node_ids)
+        removed = 0
+        for group_id, group in list(self.groups.items()):
+            if not targets.intersection(group.node_ids):
+                continue
+            group.node_ids = [node_id for node_id in group.node_ids if node_id not in targets]
+            if len(group.node_ids) < 2:
+                self.groups.pop(group_id, None)
+            removed += 1
+        if removed:
+            self.revision += 1
+        return removed
+
+    def rename_group(self, group_id: str, title: str) -> None:
+        group = self.groups.get(group_id)
+        if group is None:
+            raise GraphError(f"Unknown group: {group_id}")
+        title = title.strip()
+        if not title:
+            raise GraphError("Group title cannot be empty")
+        if group.title != title:
+            group.title = title
+            self.revision += 1
+
+    def _default_group_title(self) -> str:
+        return "Group"
+
+    def _next_group_id(self) -> str:
+        index = 1
+        group_id = f"group-{index}"
+        while group_id in self.groups:
+            index += 1
+            group_id = f"group-{index}"
+        return group_id
 
     def topological_order(self) -> list[str]:
         indegree = {node_id: 0 for node_id in self.nodes}
@@ -224,6 +297,11 @@ class RecipeGraph:
         return {
             "format": self.FORMAT,
             "revision": self.revision,
+            "edge_style": self.edge_style,
+            "groups": [
+                {"id": group.group_id, "title": group.title, "node_ids": list(group.node_ids)}
+                for group in self.groups.values()
+            ],
             "nodes": [
                 {
                     "id": node.node_id,
@@ -251,6 +329,8 @@ class RecipeGraph:
             raise GraphError(f"Unsupported recipe format: {data.get('format')}")
 
         graph = cls(definitions, int(data.get("revision", 0)))
+        edge_style = str(data.get("edge_style", "curved")).lower()
+        graph.edge_style = edge_style if edge_style in {"curved", "segmented"} else "curved"
         for item in data.get("nodes", []):
             node_id = str(item["id"])
             type_name = str(item["type"])
@@ -264,6 +344,14 @@ class RecipeGraph:
 
         for item in data.get("edges", []):
             graph.connect(str(item["source"]), str(item["target"]), str(item["target_port"]))
+        for item in data.get("groups", []):
+            group_id = str(item.get("id") or item.get("group_id") or "")
+            if not group_id:
+                continue
+            title = str(item.get("title") or "Group")
+            node_ids = [str(node_id) for node_id in item.get("node_ids", []) if str(node_id) in graph.nodes]
+            if len(node_ids) >= 2:
+                graph.groups[group_id] = NodeGroup(group_id, title, node_ids)
         graph.revision = int(data.get("revision", graph.revision))
         graph.results.clear()
         return graph

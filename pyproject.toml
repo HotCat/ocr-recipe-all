@@ -18,6 +18,9 @@ ocr = [
   "paddleocr>=2.7,<3",
   "paddlepaddle>=2.6,<3",
 ]
+modbus = [
+  "pymodbus>=3.6,<4",
+]
 
 [project.scripts]
 openfrp-vision = "openfrp_vision.app:main"
